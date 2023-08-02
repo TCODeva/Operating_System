@@ -12,7 +12,7 @@
 
 这个过程可以表示如下：
 
-![no_cache_arch](./images/no_cache_arch.jpeg)
+![](./images/no_cache_arch.jpeg)
 
 其实现实中，CPU通用寄存器的速度和主存之间存在着太大的差异。两者之间的速度大致如下关系：
 
