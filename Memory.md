@@ -1,4 +1,6 @@
-# Virtual Address Translation
+# Memory
+
+### Virtual Address Translation
 
 在Linux，Windows等操作系统中，为什么不直接使用Physical Address（物理地址），而要用Virtual Address（虚拟地址）呢？因为虚拟地址可以带来诸多好处: 
 
@@ -8,17 +10,17 @@
 
 既然使用虚拟地址，就涉及到将虚拟地址转换为物理地址的过程，这需要MMU（Memory Management Unit）和页表（page table）的共同参与。
 
-### MMU
+#### MMU
 
 MMU是处理器/核（processer）中的一个硬件单元，通常每个核有一个MMU。MMU由两部分组成：TLB(Translation Lookaside Buffer)和table walk unit。
 
 ![mmu](./images/mmu.png)
 
-### **Page Table**
+#### **Page Table**
 
 page table是每个进程独有的，是软件实现的，是存储在main memory（比如DDR）中的。
 
-### Address Translation
+#### Address Translation
 
 因为访问内存中的页表相对耗时，尤其是在现在普遍使用多级页表的情况下，需要多次的内存访问，为了加快访问速度，给page table设计了一个硬件缓存 - **TLB**，CPU会首先在TLB中查找，因为在TLB中找起来很快。TLB之所以快，一是因为它含有的entries的数目较少，二是TLB是集成进CPU的，它几乎可以按照CPU的速度运行。
 
@@ -40,7 +42,7 @@ page table是每个进程独有的，是软件实现的，是存储在main memor
 
 ![mmu](./images/address_translation.png)
 
-### Page Table Walk Example
+#### Page Table Walk Example
 
 假设当前CPU支持的虚拟地址是14位，物理地址是12位，page size为64字节（这里要说明一下，通常情况下，虚拟地址和物理地址的位数是一样的，但其实并不一定需要一样，因为允许多个虚拟地址指向同一个物理地址）。
 

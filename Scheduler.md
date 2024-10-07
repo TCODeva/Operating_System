@@ -2,7 +2,7 @@
 
 ### Priority Overview
 
-![](./images/priority_overview.gif)
+![schedule](./images/priority_overview.gif)
 
 ### User Space View
 
