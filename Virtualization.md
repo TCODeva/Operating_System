@@ -345,11 +345,11 @@ STE 采用线性表并不是真是由设备的数量来决定的，而是写在 
 
 ![smmu](./images/ste2.webp)
 
-ARM SMMU v3 第一层的目录 desc 的目录结够，大小采用 8（STRTAB_SPLIT）位，也就是 SteamID 的高 8 位，SteamID  剩下的低位全部用来寻址第二层真正的 STE。
+ARM SMMU v3 第一层的目录 desc 的目录结构，大小采用 8（STRTAB_SPLIT）位，也就是 SteamID 的高 8 位，SteamID  剩下的低位全部用来寻址第二层真正的 STE。
 
 ![smmu](./images/ste3.webp)
 
-如上如所示，红框中就是 SMMU 中一个 STE 的全貌。一个 STE 同时管理了 stage1 和 stage2 的数据结构，其中 Config 是表示 STE 有关的配置项，VMID 是指虚拟机 ID，S1ContextPtr 指向一个 Context Descriptor 的目录结构。使用 SMMU 的设备上可以跑多个任务，这些任务可以使用不同的 page table，而 SMMU 采用了 CD 来管理每个 page table，并新增一个 SubstreamID(pasid)，用于查找 CD。CD 在 SMMU 中也是可以是线性的或者两级的，可以在 SMMU 寄存器中配置，由 SMMU 驱动来读去，进行按对应的位进行分级，和 SET 表一样的原理。
+如上如所示，红框中就是 SMMU 中一个 STE 的全貌。一个 STE 同时管理了 stage1 和 stage2 的数据结构，其中 Config 是表示 STE 有关的配置项，VMID 是指虚拟机 ID，S1ContextPtr 指向一个 Context Descriptor 的目录结构。使用 SMMU 的设备上可以跑多个任务，这些任务可以使用不同的 page table，而 SMMU 采用了 CD 来管理每个 page table，并新增一个 SubstreamID(pasid)，用于查找 CD。CD 在 SMMU 中也是可以是线性的或者两级的，可以在 SMMU 寄存器中配置，由 SMMU 驱动来读去，进行按对应的位进行分级，和 STE 表一样的原理。
 
 ![smmu](./images/ste4.webp)
 
@@ -477,7 +477,8 @@ static int arm_smmu_device_probe(struct platform_device *pdev)
 
     /* 将 smmu 的基本数据结构注册到上层的 iommu 抽象框架里，简单说明下此框架：能够有能力完成设备 iova 到 pa 转换的有很多，
      * 例如有 intel iommu, amd 的 iommu ,arm 的 smmu 等等。这些不同的硬件架构不会都作为一个独立的子系统，
-     * 所以，在 linux 内核中 抽象了一层 iommu 层，由 iommu 层给各个外部设备驱动提供结构，隐藏底层的不同的架构 */
+     * 所以，在 linux 内核中 抽象了一层 iommu 层，由 iommu 层给各个外部设备驱动提供结构，隐藏底层的不同的架构
+     */
 	ret = iommu_device_register(&smmu->iommu);
 	if (ret) {
 		dev_err(dev, "Failed to register iommu\n");
