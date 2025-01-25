@@ -1350,7 +1350,7 @@ static inline pgoff_t linear_page_index(struct vm_area_struct *vma, unsigned lon
 
 ##### 内存页回收
 
-###### **为什么会有 active 链表和 inactive 链表**？
+###### active 和 inactive 链表
 
 内存回收的关键是如何实现一个高效的页面替换算法 PFRA (Page Frame Replacement Algorithm) ，最典型的页面替换算法就是  LRU (Least-Recently-Used) 算法。LRU 算法的核心思想就是那些最近最少使用的页面，在未来的一段时间内可能也不会再次被使用，所以在内存紧张的时候，会优先将这些最近最少使用的页面置换出去。在这种情况下其实一个 active 链表就可以满足我们的需求。但是这里会有一个严重的问题，LRU 算法更多的是在时间维度上的考量，突出最近最少使用，但是它并没有考量到使用频率的影响，假设有这样一种状况，就是一个页面被疯狂频繁的使用，毫无疑问它肯定是一个热页，但是这个页面最近的一次访问时间离现在稍微久了一点点，此时进来大量的页面，这些页面的特点是只会使用一两次，以后将再也不会用到。在这种情况下，根据 LRU 的语义这个之前频繁地被疯狂访问的页面就会被置换出去了（本来应该将这些大量一次性访问的页面置换出去的），当这个页面在不久之后要被访问时，此时已经不在内存中了，还需要在重新置换进来，造成性能的损耗。这种现象也叫 Page Thrashing（页面颠簸）。因此，内核为了将页面使用频率这个重要的考量因素加入进来，于是就引入了 active 链表和 inactive 链表。工作原理如下：
 
@@ -1361,7 +1361,7 @@ static inline pgoff_t linear_page_index(struct vm_area_struct *vma, unsigned lon
 
 内核在回收内存的时候，这两个列表中的回收优先级为：inactive 链表尾部 > inactive 链表头部 > active 链表尾部 > active 链表头部。
 
-###### **为什么会把 active 链表和 inactive 链表分成两类，一类是匿名页，一类是文件页**？
+###### **匿名页与文件页**
 
 假设现在只有 active 链表和 inactive 链表，不对这两个链表进行匿名页和文件页的归类，在需要页面置换的时候，内核会先从 active 链表尾部开始扫描，当  swappiness 被设置为 0 时，内核只会置换文件页，不会置换匿名页。由于 active 链表和 inactive 链表没有进行物理页面类型的归类，所以链表中既会有匿名页也会有文件页，如果链表中有大量的匿名页的话，内核就会不断的跳过这些匿名页去寻找文件页，并将文件页替换出去，这样从性能上来说肯定是低效的。因此内核将 active 链表和 inactive 链表按照匿名页和文件页进行了归类，当  swappiness 被设置为 0 时，内核只需要去 `nr_zone_active_file` 和 `nr_zone_inactive_file `链表中扫描即可，提升了性能。
 
@@ -2956,45 +2956,541 @@ static inline int page_is_buddy(struct page *page, struct page *buddy,
 
 
 
-### Virtual Address Translation
+### 页表映射
 
-在Linux，Windows等操作系统中，为什么不直接使用Physical Address（物理地址），而要用Virtual Address（虚拟地址）呢？因为虚拟地址可以带来诸多好处: 
+![memory](./images/memory67.png)
 
-1. 在支持多进程的系统中，如果各个进程的镜像文件都使用物理地址，则在加载到同一物理内存空间的时候，可能发生冲突。
-2. 直接使用物理地址，不便于进行进程地址空间的隔离。
-3. 物理内存是有限的，在物理内存整体吃紧的时候，可以让多个进程通过分时复用的方法共享一个物理页面（某个进程需要保存的内容可以暂时swap到外部的disk/flash），这有点类似于多线程分时复用共享CPU的方式。
+如上图所示，在内存映射的场景中，虚拟内存页的类型总共分为以下三种：
 
-既然使用虚拟地址，就涉及到将虚拟地址转换为物理地址的过程，这需要MMU（Memory Management Unit）和页表（page table）的共同参与。
+1. 第一种就是图中灰色方框里标注的**未分配页面**，进程的虚拟内存空间是非常庞大的，远远的超过物理内存空间，但这并不意味着进程可以直接随意使用虚拟内存，事实上进程对虚拟内存的使用也是需要向内核申请的。进程虚拟内存空间中的虚拟内存页在未被进程申请之前的状态就是未分配页面。
+2. 第二种就是图中紫色方框里标注的**已分配未映射页面**，在进程中可以通过 malloc 接口或者直接通过系统调用 mmap 向内核申请虚拟内存，申请到的虚拟内存页此时就变为了已分配的页面。但此时的虚拟内存页只是虚拟内存，其背后并没有与物理内存映射起来，所以称为已分配未映射页面。
+3. 第三种是图中绿色方框里标注的**正常页面**，当进程开始读写这些已分配未映射的虚拟内存页时，在 CPU 中用于地址翻译的硬件 MMU 会产生一个缺页中断，随后内核会为其分配相应的物理内存页面，并将虚拟内存页与物理内存页映射起来。此时这些已分配未映射的虚拟内存页就变为了**正常页面**。从此以后，进程就可以正常读写这些虚拟内存页了。
 
-#### MMU
+还能得出以下结论：
 
-MMU是处理器/核（processer）中的一个硬件单元，通常每个核有一个MMU。MMU由两部分组成：TLB(Translation Lookaside Buffer)和table walk unit。
+1. 每个进程独占全部的虚拟内存空间，比如上图中，进程 1 的虚拟内存空间（蓝色部分）和进程 2 的虚拟内存空间（黄色部分）它们都拥有属于各自的虚拟内存页1 到虚拟内存页 7 这段范围的虚拟内存。也就是说进程1 和进程 2 看到的虚拟内存空间**地址范围**都是一样的。
+2. 每个进程的虚拟内存空间都是相互隔离，互不干扰的，进程可以在属于自己的虚拟内存空间里随意折腾。比如上图中，进程 1 里的虚拟内存页 1 是一个未分配页面，而进程 2 里的虚拟内存页 1 却是一个正常页面，被内核映射到物理内存页 2 中。也就是说虽然每个进程拥有的虚拟内存地址空间范围是一样的，但是各自虚拟内存空间中的虚拟页可能映射的物理页不一样，使用的方式和用途也不一样。
+3. 进程所看到的连续虚拟内存，在物理内存中有可能是不连续的，比如上图中，进程 1 里的虚拟页 4 和 虚拟页 5，它们在进程 1 的虚拟内存空间中是连续的，但是它们背后映射的物理内存页却是不连续的。虚拟内存页 4 被映射到了物理内存页 1 中，虚拟内存页 5 被映射到了物理内存页 4 中。
+
+内核会从物理内存空间中拿出一个物理内存页来专门存储进程里的这些内存映射关系，而这种物理内存被称之为页表，所以页表的本质其实就是一个物理内存页。页表除了管理虚拟内存与物理内存之间的映射关系之外，还会有一些访问权限的管理，来控制进程对物理内存的访问权限。由于进程是独占虚拟内存空间的，而且不同进程之间的虚拟内存空间是相互隔离的，所以每个进程也都会有属于自己的页表，来专门管理各自虚拟内存空间中的映射关系以及各自访问物理内存的权限。
+
+内核会在页表中划分出来一个个大小相等的小内存块，这些小内存块称之为页表项 PTE（Page Table Entry），正是这个 PTE 保存了进程虚拟内存空间中的虚拟页与物理内存页的映射关系，以及控制物理内存访问的相关权限位。在 32 位系统中页表中的 PTE 占用 4 个字节，64 位系统中页表的 PTE 占用 8 个字节。
+
+![memory](./images/memory68.png)
+
+进程虚拟内存空间中的每一个字节都有一个虚拟内存地址来表示，格式为：`页表内偏移 + 物理内存页内偏移`
+
+![memory](./images/memory69.png)
+
+ `页表内偏移` 是专门用来定位虚拟内存页在页表中的 PTE 的，因为页表本质其实还是一个物理内存页，而一个物理内存页里边的内存肯定都是连续的，每个 PTE 的尺寸又是相同的，所以可以把页表看做一个数组，PTE 看做数组里的元素，在一个数组里定位元素，直接通过元素的索引 index 就可以定位了。这个索引 index 就是 `页表内偏移` 。这样一来，给定一个虚拟内存地址，内核会先从这个虚拟内存地址中提取出 `页表内偏移` ，然后根据 `页表起始地址 + 页表内偏移 * sizeof(PTE)` 就能获取到该虚拟内存地址所在虚拟页在页表中对应的 PTE 了。页表的起始地址保存在 `struct mm_struct` 结构中的 pgd 字段中。
+
+```c
+_do_fork
+    copy_process
+    	copy_mm
+    		dup_mm
+/**
+ * Allocates a new mm structure and duplicates the provided @oldmm structure
+ * content into it.
+ */
+static struct mm_struct *dup_mm(struct task_struct *tsk,
+    struct mm_struct *oldmm)
+{
+     // 子进程虚拟内存空间，此时还是空的
+     struct mm_struct *mm;
+     int err;
+     // 为子进程申请 mm_struct 结构
+     mm = allocate_mm();
+     if (!mm)
+        goto fail_nomem;
+     // 将父进程 mm_struct 结构里的内容全部拷贝到子进程 mm_struct 结构中
+     memcpy(mm, oldmm, sizeof(*mm));
+     // 为子进程分配顶级页表起始地址并赋值给 mm_struct->pgd
+     if (!mm_init(mm, tsk, mm->user_ns))
+        goto fail_nomem;
+     // 拷贝父进程的虚拟内存空间中的内容以及页表到子进程中
+     err = dup_mmap(mm, oldmm);
+     if (err)
+        goto free_pt;
+
+     return mm;
+}
+
+static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
+    struct user_namespace *user_ns)
+{
+    // 初始化子进程的 mm_struct 结构
+    ......
+    // 为子进程分配顶级页表起始地址 pgd
+    if (mm_alloc_pgd(mm))
+        goto fail_nopgd;
+    ......
+}
+
+static inline int mm_alloc_pgd(struct mm_struct *mm)
+{
+    // 内核为子进程分配好其顶级页表起始地址之后，赋值给子进程 mm_struct 结构中的 pgd 属性
+    mm->pgd = pgd_alloc(mm);
+    if (unlikely(!mm->pgd))
+        return -ENOMEM;
+    return 0;
+}
+
+
+/* 虽然已经创建了 pgd ，但现在还只是顶级页表的虚拟内存地址，还无法被 CPU 直接使用。 */
+
+// 将 mm->pgd 写入 ttbr 寄存器中
+context_switch
+    switch_mm_irqs_off
+    	__switch_mm
+    		check_and_switch_context
+    			cpu_switch_mm
+    				cpu_do_switch_mm
+```
+
+![memory](./images/memory70.png)
+
+X86 架构下页表基地址保存在 CR3 寄存器中，ARM 架构下保存在 TTBR 寄存器中，但寻址原理是一样的。CPU 访问进程的虚拟地址时，首先会从 CR3/TTBR 寄存器中获取到当前进程的页表基地址，然后从虚拟内存地址中提取出虚拟内存页对应 PTE 在页表内的偏移，通过 `页表起始地址 + 页表内偏移 * sizeof(PTE)` 这个公式定位到虚拟内存页在页表中所对应的 PTE。而虚拟内存页背后所映射的物理内存页的起始地址就保存在该 PTE 中，随后 CPU 继续从虚拟内存地址中提取后半部分——物理内存页内偏移，并通过 `物理内存页起始地址 + 物理内存页内偏移` 就定位到了该物理内存页中一个具体的物理字节上。
+
+当用户进程被 CPU 调度起来，访问进程虚拟内存的时候，虚拟内存地址与物理内存地址转换的过程都是**在用户态进行的**，正常的内存访问无需进入内核态。除非 CPU 访问的虚拟内存页面类型是：
+
+1. 未分配页面。
+2. 已分配未映射页面。
+3. 已映射，但是由于内存紧张的原因，该虚拟内存页映射的物理内存页被置换到磁盘上了。
+
+以上三种虚拟内存页有一个共同的特征就是它们背后的物理内存页均不在内存中，要么是没有映射，要么是被置换到磁盘上。当 CPU 访问这些虚拟内存页面的时候，就会产生缺页中断，随后进入内核态为其分配物理内存页面，填充物理内存页面中的内容，最后在页表中建立映射关系。之后的内存访问均是在用户态中进行。所以页表也就分为了两个部分：
+
+1. 进程用户态页表：主要负责管理进程用户态虚拟内存空间到物理内存的映射关系。
+2. 内核态页表：主要负责管理内核态虚拟内存空间到物理内存的映射关系，这一部分主要供内核使用。
+
+```c
+struct mm_struct init_mm = {
+	.mm_mt		= MTREE_INIT_EXT(mm_mt, MM_MT_FLAGS, init_mm.mmap_lock),
+	.pgd		= swapper_pg_dir,
+	.mm_users	= ATOMIC_INIT(2),
+	.mm_count	= ATOMIC_INIT(1),
+	.write_protect_seq = SEQCNT_ZERO(init_mm.write_protect_seq),
+	MMAP_LOCK_INITIALIZER(init_mm)
+	.page_table_lock =  __SPIN_LOCK_UNLOCKED(init_mm.page_table_lock),
+	.arg_lock	=  __SPIN_LOCK_UNLOCKED(init_mm.arg_lock),
+	.mmlist		= LIST_HEAD_INIT(init_mm.mmlist),
+#ifdef CONFIG_PER_VMA_LOCK
+	.mm_lock_seq	= 0,
+#endif
+	.user_ns	= &init_user_ns,
+	.cpu_bitmap	= CPU_BITS_NONE,
+	INIT_MM_CONTEXT(init_mm)
+};
+
+SYM_FUNC_START_LOCAL(secondary_startup)
+	/*
+	 * Common entry point for secondary CPUs.
+	 */
+	mov	x20, x0				// preserve boot mode
+
+#ifdef CONFIG_ARM64_VA_BITS_52
+alternative_if ARM64_HAS_VA52
+	bl	__cpu_secondary_check52bitva
+alternative_else_nop_endif
+#endif
+
+	bl	__cpu_setup			// initialise processor
+	adrp	x1, swapper_pg_dir
+	adrp	x2, idmap_pg_dir
+	bl	__enable_mmu
+	ldr	x8, =__secondary_switched
+	br	x8
+SYM_FUNC_END(secondary_startup)
+    
+/*
+ * Enable the MMU.
+ *
+ *  x0  = SCTLR_EL1 value for turning on the MMU.
+ *  x1  = TTBR1_EL1 value
+ *  x2  = ID map root table address
+ *
+ * Returns to the caller via x30/lr. This requires the caller to be covered
+ * by the .idmap.text section.
+ *
+ * Checks if the selected granule size is supported by the CPU.
+ * If it isn't, park the CPU
+ */
+	.section ".idmap.text","a"
+SYM_FUNC_START(__enable_mmu)
+	mrs	x3, ID_AA64MMFR0_EL1
+	ubfx	x3, x3, #ID_AA64MMFR0_EL1_TGRAN_SHIFT, 4
+	cmp     x3, #ID_AA64MMFR0_EL1_TGRAN_SUPPORTED_MIN
+	b.lt    __no_granule_support
+	cmp     x3, #ID_AA64MMFR0_EL1_TGRAN_SUPPORTED_MAX
+	b.gt    __no_granule_support
+	phys_to_ttbr x2, x2
+	msr	ttbr0_el1, x2			// load TTBR0
+	load_ttbr1 x1, x1, x3
+
+	set_sctlr_el1	x0
+
+	ret
+SYM_FUNC_END(__enable_mmu)
+```
+
+现在内核页表已经被创建和初始化好了，但是对于处于内核态的进程以及内核线程来说并不能直接访问这个内核页表，它们只能访问内核页表的 copy 副本，进程的页表分为两个部分，一个是进程用户态页表，另一个就是内核页表的 copy 部分。用户态进程通过系统调用切入到内核态之后，就会使用内核页表的这部分 copy 副本，来访问内核空间虚拟内存映射的物理内存。当进程页表中内核部分的拷贝副本与主内核页表不同步时，进程在内核态就会发生缺页中断，随后会同步主内核页表到进程页表中，这里又是延时拷贝在内核中的一处应用。
+
+内核线程有一点和用户态进程不同，内核线程只能运行在内核态，而在内核态中，所有进程看到的虚拟内存空间全部都是一样的，所以对于内核线程来说并不需要为其单独的定义 `mm_struct` 结构来描述内核虚拟内存空间，内核线程的 `struct task_struct` 结构中的 mm 属性指向 null，内核线程之间调度是不涉及地址空间切换的，从而避免了无用的 TLB 缓存以及 CPU 高速缓存的刷新。
+
+```c
+ struct task_struct {
+    // 用户态进程的 mm 都是在 fork 是独立创建出来的
+    // 内核线程的 mm 则为 null
+    struct mm_struct  *mm;
+}
+```
+
+但是内核线程依然需要访问内核空间中的虚拟内存，处理的策略是，当一个内核线程被调度时，它会发现自己的虚拟地址空间为 null，虽然它不会访问用户态的内存，但是它会访问内核内存，此时会将调度之前的上一个用户态进程的虚拟内存空间 `mm_struct` 直接赋值给内核线程 `task_struct->active_mm` 中 。因为内核线程不会访问用户空间的内存，它仅仅只会访问内核空间的内存，所以直接复用上一个用户态进程页表的内核部分就可以避免为内核线程分配 mm_struct 和相关页表的开销，以及避免内核线程之间调度时地址空间的切换开销。
+
+```c
+ struct task_struct {
+    // 用户态进程的 active_mm 指向 null
+    // 内核线程的 active_mm 指向前一个进程的地址空间
+    struct mm_struct *active_mm;
+}
+```
+
+#### 单级页表的不足
+
+在进程中虚拟内存与物理内存的映射是以页为单位的，进程虚拟内存空间中的一个虚拟内存页映射物理内存空间的一个物理内存页，这种映射关系以及访存权限都保存在 PTE 中。以 32 位系统为例，页表中的一个 PTE 占用 4B 大小，所以一张页表可以容纳 1024 个 PTE（`4K / 4B = 1024`），一个 PTE 又可以映射 4K 的物理内存，那么一张页表就可以映射 `1024 * 4K = 4M` 大小的物理内存 ，而页表本质上是一个物理内存页（4K大小），所以内核需要用额外的 4K 大小的物理内存去映射 4M 的物理内存。假设系统中有 4G 的物理内存，一张页表能够映射 4M 大小的物理内存，而为了映射这 4G 的物理内存，我们需要 1024 张页表，一张页表占用 4K 物理内存，所以为了映射 4G 的物理内存，需要 4M 的物理内存（1024张页表）来映射。
+
+![memory](./images/memory71.png)
+
+更重要的是这 4M 物理内存（1024张页表）还必须是连续的，因为页表是单级的，而页表相当于是 PTE 的数组，进程虚拟内存空间中的一个虚拟内存页对应一个 PTE，而 PTE 在页表这个数组中的索引 index 就保存在虚拟内存地址中，内核通过页表的起始地址加上这个索引 index 才能定位到虚拟内存页对应的 PTE，近而通过 PTE 定位到映射的物理内存页。
+
+而且 4M 的连续物理内存还只是一个进程所需要的，因为进程的虚拟内存空间都是独立的，页表也是独立的，一个进程就需要额外的 4M 连续物理内存（1024张页表）来支持进程内独立的内存映射关系。假如在系统中跑上 100 个进程，那总共就需要额外的 400M 连续的物理内存。这对于一个只有 4G 物理内存，单级页表的系统来说，无疑是巨大的开销和浪费。
+
+程序局部性原理表现为：时间局部性和空间局部性。时间局部性是指如果程序中的某条指令一旦执行，则不久之后该指令可能再次被执行；如果某块数据被访问，则不久之后该数据可能再次被访问。空间局部性是指一旦程序访问了某个存储单元，则不久之后，其附近的存储单元也将被访问。
+
+####  多级页表的演进
+
+![memory](./images/memory72.png)
+
+二级页表中的一个 PTE 本质上指向的还是一个物理内存页，只不过这个物理内存页比较特殊，它是一张页表（一级页表），一级页表是用来映射真正的物理内存的，一张一级页表可以映射 4M 物理内存。这也就是说二级页表中的一个 PTE 就可以映射 4M 物理内存，同样的道理，二级页表中也包含了 1024 个 PTE，所以一张二级页表就可以映射 4G 的物理内存。虽说二级页表和一级页表本质上都是一样的，它们都是一个物理内存页，但是习惯上将二级页表叫做页目录表，用来做一级页表的索引，就好像书中的目录一样，二级页表中的 PTE 称为做页目录项 (Page Directory Entry, PDE)。因为一张页目录表就可以映射 4G 的物理内存了，所以在二级页表的情况下，只需要在进程启动的时候额外为它分配 4K 的连续物理内存就可以了，这相比单级页表下，需要为每个进程额外分配 4M 的连续物理内存节省了非常多宝贵的内存资源。
+
+![memory](./images/memory73.png)
+
+当前系统中，进程只有一张页目录表，页目录表里的 PDE 没有映射任何东西，这时进程需要访问一个物理内存页，而对物理内存页的映射任务主要是在一级页表的 PTE 中，所以现在首要的任务就是建立一张一级页表出来，并用页目录表索引起来。
+
+![memory](./images/memory74.png)
+
+在二级页表的情况下，内核只需要一张 4K 的页目录表和一张 4K 的一级页表总共 8K 的内存就可以支持进程访问一个 4K 物理页面了，而根据程序的空间局部性原理，在不久的将来，进程只会访问与该物理内存页临近的页面，所以事实上，即使进程访问 4M 的内存，依然只需要一张 4K 的页目录表和一张 4K 的一级页表就可以满足了。
+
+![memory](./images/memory75.png)
+
+当进程需要访问下一个 4M 的物理内存时，这时候第一个一级页表已经映射满了，那就需要再创建第二张页表用来映射下一个 4M 的物理内存，当然了，第二张页表依然需要索引在页目录表的 PDE 中。这时候内核就需要一张页目录表和两张一级页表共 12K 额外的物理内存来映射，这依然比单级页表的 4M 连续物理内存开销小很多。
+
+![memory](./images/memory76.png)
+
+同理，随着进程一个 4M 接着一个 4M 物理内存的访问，在极端的情况下整个页目录表都被映射满了，这时候内核就需要 4K（页目录表）+ 4M（1024张一级页表）的额外内存来保存映射关系了，这种情况下看起来会比单级页表下的 4M 内存开销大了那么一点点，但这种属于极端情况，非常少见，极大部分情况下还是比单级页表开销少很多很多的。
+
+而且在二级页表体系下，上面极端情况中的这 1024 张一级页表不需要是连续的，因为只需要保证顶级页表（这里指页目录表）是连续的就可以了，通过页目录表中的 PDE 可以唯一索引到一张一级页表的起始物理内存地址，而页表内肯定是连续的 4K 物理内存，所以依然可以通过数组的方式索引到一级页表中的 PTE，近而找到其映射的物理内存页面。
+
+除此之外二级页表体系还有一个优势，就是当内存紧张的时候，那些不经常使用的一级页表可以被 swap out 到磁盘中，当进程再次访问到该页表映射的物理内存时，内核在将页表从磁盘中 swap in 到内存中。当然了，顶级页表（这里指页目录表）必须是常驻内存的，不允许 swap 。
+
+![memory](./images/memory77.png)
+
+页表的本质是一个物理内存页，进程经常访问的那些页表也会被缓存到 CPU 高速缓存中加速下一次的访问速度。
+
+![memory](./images/memory78.png)
+
+![memory](./images/memory79.png)
+
+##### 二级页表
+
+从单级页表演进到二级页表之后，虚拟内存寻址的底层逻辑还是一样的，只不过现在的顶级页表变成了页目录表（Page Directory）, CR3/TTBR 寄存器现在存放的是页目录表的起始物理内存地址。
+
+![memory](./images/memory80.png)
+
+通过虚拟内存地址定位 PTE 的步骤由原来的一步变成了现在的两步，因为多加了一级页目录表，所以现在需要首先定位页目录表中的 PDE，然后通过 PDE 定位到具体的页表，近而找到页表中的 PTE。在二级页表体系下的虚拟内存地址的格式也就发生了变化，单级页表下虚拟内存地址中只需要保存页表中的 PTE 偏移即可，二级页表下虚拟内存地址还需要多保存一份页目录表中 PDE 的偏移。
+
+![memory](./images/memory81.png)
+
+二级页表应用在 32 位系统中，相应的虚拟内存地址由 32 位 bit 组成，在 32 位系统中页目录表中的 PDE 和页表中的 PTE 均占用 4 个字节。页目录表和页表的本质其实就是一个物理内存页，它们分别占用 4K 大小。因此一张页目录表中有 1024 个 PDE，要寻址这 1024 个 PDE 用 10 个 bit 就可以了，所以在上图中的虚拟内存地址中的 `页目录表中 PDE 偏移` 部分占用 10 个 bit 位。同样的道理，一张页表中有 1024 个 PTE，要寻址这个 1024 个 PTE 也是需要 10 个 bit，虚拟内存地址中的 `一级页表中 PTE 偏移` 部分也需要占用 10 个 bit 位。
+
+这样一来就可以通过虚拟内存地址中的前 10 个 bit 定位到页目录表中的 PDE ，而 PDE 指向的是一级页表的起始物理内存地址，通过接下来的 10 个 bit 就可以定位到页表中的 PTE，而 PTE 指向的是虚拟内存页最终映射的物理内存页的起始地址。找到物理内存页了后，这就需要虚拟内存地址中的最后一部分 `物理内存页内偏移`来确定物理地址，因为一个物理内存页占用 4K 大小，用 12 位 bit 就可以寻址内存页中的任意字节了。这样加起来，刚好可以组成一个 32 位的虚拟内存地址。
+
+![memory](./images/memory82.png)
+
+1. 当 CPU 访问进程虚拟内存空间中的一个地址时，会先从 CR3/TTBR 寄存器中拿出页目录表的起始物理内存地址，然后从虚拟内存地址中解析出前 10 bit 的内容作为页目录表中 PDE 的偏移，通过公式 `页目录表起始地址 + 页目录表内偏移 * sizeof(PDE)` 就可以定位到该虚拟内存页在页目录表中的 PDE 了。
+2. PDE 中保存了其指向的一级页表的起始物理内存地址，再从虚拟内存地址中解析出下一个 10 bit 作为页表中 PTE 的偏移，然后通过公式 `页表起始地址 + 页表内偏移 * sizeof(PTE)` 就能定位到虚拟内存页在一级页表中的 PTE 了。
+3. PTE 中保存了最终映射的物理内存页的起始地址，最后从虚拟内存地址中解析出最后 12 个 bit，最终定位到虚拟内存地址对应的物理字节上。
+
+PTE 在内核中是用 `unsigned long` 类型描述的，在 32 位系统中占用 4 个字节：
+
+```c
+typedef unsigned long	pteval_t;
+typedef struct { pteval_t pte; } pte_t;
+```
+
+![memory](./images/memory83.png)
+
+由于内核将整个物理内存划分为一页一页的单位，每个物理内存页大小为 4K，所以物理内存页的起始地址都是按照 4K 对齐的，也就导致物理内存页的起始地址的后 12 位全部是 0，只需要在 PTE 中存储物理内存地址的高 20 位就可以了，剩下的低 12 位可以用来标记一些权限位。下面是 PTE 权限位的含义：
+
+`P(0)` 表示该 PTE 映射的物理内存页是否在内存中，值为 1 表示物理内存页在内存中驻留，值为 0 表示物理内存页不在内存中，可能被 swap 到磁盘上了。当 PTE 中的 P 位为 0 时，上图中的其他权限位将变得没有意义，这种情况下其他 bit 位存放物理内存页在磁盘中的地址。当物理内存页需要被 swap in 的时候，内核会在这里找到物理内存页在磁盘中的位置。通过虚拟内存寻址过程找到其对应的 PTE 之后，首先会检查它的 P 位，如果为 0 直接触发缺页中断（page fault），随后进入内核态，由内核的缺页异常处理程序负责将映射的物理页面换入到内存中。
+
+`R/W(1)` 表示进程对该物理内存页拥有的读，写权限，值为 1 表示进程对该物理页拥有读写权限，值为 0 表示进程对该物理页拥有只读权限，进程对只读页面进行写操作将触发 page fault （写保护中断异常），用于写时复制（Copy On Write， COW）的场景。比如，父进程通过 fork 系统调用创建子进程之后，父子进程的虚拟内存空间完全是一模一样的，包括父子进程的页表内容都是一样的，父子进程页表中的 PTE 均指向同一物理内存页面，此时内核会将父子进程页表中的 PTE 均改为只读的，并将父子进程共同映射的这个物理页面引用计数 + 1。当父进程或者子进程对该页面发生写操作的时候，假设子进程先对页面发生写操作，随后子进程发现自己页表中的 PTE 是只读的，于是产生写保护中断，子进程进入内核态，在内核的缺页中断处理程序中发现，访问的这个物理页面引用计数大于 1，说明此时该物理内存页面存在多进程共享的情况，于是发生写时复制（Copy On Write， COW），内核为子进程重新分配一个新的物理页面，然后将原来物理页中的内容拷贝到新的页面中，最后子进程页表中的 PTE 指向新的物理页面并将 PTE 的 R/W 位设置为 1，原来物理页面的引用计数 - 1。后面父进程在对页面进行写操作的时候，同样也会发现父进程的页表中 PTE 是只读的，也会产生写保护中断，但是在内核的缺页中断处理程序中，发现访问的这个物理页面引用计数为 1 了，那么就只需要将父进程页表中的 PTE 的 R/W 位设置为 1 就可以了。
+
+`U/S(2)` 值为 0 表示该物理内存页面只有内核才可以访问，值为 1 表示用户空间的进程也可以访问。
+
+`PCD(4)` 是 Page Cache Disabled 的缩写，表示 PTE 指向的这个物理内存页中的内容是否可以被缓存再 CPU CACHE 中，值为 1 表示 Disabled，值为 0 表示 Enabled。
+
+`PWT(3)` 同样也是和 CPU CACHE 相关的控制位，Page Write Through 的缩写，值为 1 表示 CPU CACHE 中的数据发生修改之后，采用 Write Through 的方式同步回物理内存页中。值为 0 表示采用 Write Back 的方式同步回物理内存页。当 CPU 修改了高速缓存中的数据之后，这些修改后的缓存内容同步回内存的方式有两种：
+
+1. Write Back：CPU 修改后的缓存数据不会立马同步回内存，只有当 cache line 被替换时，这些修改后的缓存数据才会被同步回内存中，并覆盖掉对应物理内存页中旧的数据。
+2. Write Through：CPU 修改高速缓存中的数据之后，会立刻被同步回物理内存页中。
+
+`A(5)` 表示 PTE 指向的这个物理内存页最近是否被访问过，1 表示最近被访问过（读或者写访问都会设置为 1），0 表示没有。该 bit 位被硬件 MMU 设置，由操作系统重置。内核会经常检查该比特位，以确定该物理内存页的活跃程度，不经常使用的内存页，很可能就会被内核 swap out 出去。
+
+`D(6)` 主要针对文件页使用，当 PTE 指向的物理内存页是一个文件页时，进程对这个文件页写入了新的数据，这时文件页就变成了脏页，对应的 PTE 中 D 比特位会被设置为 1，表示文件页中的内容与其背后对应磁盘中的文件内容不同步了。
+
+`PAT(7)` 表示是否支持 PAT(Page Attribute Table) 。
+
+`G(8)` 设置为 1 表示该 PTE 是全局的，该标志位表示 PTE 中保存的映射关系是否是全局的。一般来说进程都有各自独立的虚拟内存空间，进程的页表也是独立的 ，CPU 每次访问进程虚拟内存地址的时候都需要进行地址翻译。为了加速地址翻译的速度，避免每次遍历页表，CPU 会把经常被访问到的 PTE 缓存在一个 TLB 的硬件缓存中，由于 TLB 中缓存的是当前进程相关的 PTE，所以操作系统每次在切换进程的时候，都会重新刷新 TLB 缓存。而有一些 PTE 是所有进程共享的，比如说内核虚拟内存空间中的映射关系，所有进程进入内核态看到的都是一样的。所以会将这些全局共享的 PTE 中的 G 比特位置为 1 ，这样在每次进程切换的时候，就不会 flush 掉 TLB 缓存的那些共享的全局 PTE（比如内核地址的空间中使用的 PTE），从而在很大程度上提升了性能。
+
+PDE 在 32 位系统中也是用 `unsigned long` 类型来描述的，同样也是占用 4 个字节大小。
+
+```c
+typedef unsigned long	pgdval_t;
+```
+
+PDE 是用来指向一级页表的起始物理内存地址的，而页表的本质是一个物理内存页（4K 大小），因此页表的起始内存地址也是按照 4K 对齐的，后 12 位全部为 0 ，可以继续用 PDE 的低 12 位来标记页目录项的权限位：
+
+![memory](./images/memory84.png)
+
+和页表中 PTE 的权限位有几点不同：
+
+1. PDE 中的第 6 个比特位脏页标记位没有了，因为 PDE 指向的是一级页表，页表并不是一个文件页，所以脏页标记在这里就没有意义了。
+2.  PDE 中的第 8 比特位，Global 全局标记位也没有了，因为 TLB 缓存的 PTE 而不是 PDE，所以不需要设置 Global 标记来防止进程切换导致 TLB flush。
+3.  PDE 中的第 7 比特位由 PTE 中的 PAT 标记变为了 PS 标记位。当 PS 标记为 `0` 的时候，PDE 的映射关系确实如本小节第一张图中所示，PDE 指向一级页表的起始内存地址，这种情况下，PDE 的作用确实是我们前边介绍的页目录项的作用。但是当 PS 标记为 `1` 的时候，PDE 就会被内核拿来当做 PTE 使用，不过这个 ”PTE“ 比较特殊，其特殊之处在于该 PDE 会指向一个大页内存，这个物理内存页不是普通的 4K 大小，而是 4M 大小。
+
+![memory](./images/memory85.png)
+
+在二级页表体系下，页目录表中的一个 PDE 可以映射的物理内存空间是 4M ，既然这样，PDE 也可以直接指向一张 4M 的内存大页。相比普通页表，使用大页也有其优势：
+
+1. 在一些内存敏感的使用场景中，用户往往期望使用一些大页。因为这些大页要比普通的 4K 内存页要大很多，所以遇到缺页中断的情况就会相对减少，由于减少了缺页中断所以性能会更高。
+2. 由于大页比普通页要大，所以大页需要的页表项要比普通页要少，页表项里保存了虚拟内存地址与物理内存地址的映射关系，当 CPU 访问内存的时候需要频繁通过 MMU 访问页表项获取物理内存地址，由于要频繁访问，所以页表项一般会缓存在 TLB 中，因为大页需要的页表项较少，所以节约了 TLB 的空间同时降低了 TLB 缓存 MISS 的概率，从而加速了内存访问。
+3. 当一个内存占用很大的进程（比如 Redis）通过 fork 系统调用创建子进程的时候，会拷贝父进程的相关资源，其中就包括父进程的页表，由于巨型页使用的页表项少，所以拷贝的时候性能会提升不少。
+
+既然 PS 标记为 1 的情况下，PDE 指向的是一个 4M 的物理大页内存，这种情况下内核就把 PDE 当做一个特殊的 ”PTE“ 使用了，所以 PDE 中的比特位布局又发生了变化，不过大部分还是和 PTE 一样的。
+
+![memory](./images/memory86.png)
+
+ `31:13`  比特位的作用，粗略的从总体来讲这个范围的比特位确实是用来保存 4M 大页的起始内存地址的。但是进一步细分来说，其实 4M 内存大页的起始地址都是按照 4M 对齐的，也就是说 4M 大页的起始内存地址的后 22 位全部为 0 ，只需要用 10 个比特位就可以标记了，事实上，4M 大页的起始内存地址在内核中就是使用 `31:22` 范围内的比特标记的，剩下的比特用来做内存地址的扩展使用。
+
+##### 四级页表
+
+64 位系统中的四级页表相比 32 位系统中的二级页表来说，多引入了两个层级的页目录，分别是四级页表和三级页表，四级页表体系完整的映射关系如下图所示：
+
+![memory](./images/memory87.png)
+
+内核中称四级页表为全局页目录 PGD（Page Global Directory），PGD 中的页目录项叫做 pgd_t，PGD 是四级页表体系下的顶级页表，保存在进程 `struct mm_struct` 结构中的 pgd 字段中。三级页表在内核中称之为上层页目录 PUD（Page Upper Directory），PUD 中的页目录项叫做 pud_t 。二级页表叫做中间页目录 PMD（Page Middle Directory），PMD 中的页目录项叫做 pmd_t，最底层的用来直接映射物理内存页面的一级页表，名字不变还叫做页表（Page Table）由于在四级页表体系下，又多引入了两层页目录（PGD,PUD），所以导致其通过虚拟内存地址定位 PTE 的步骤又增加了两步，首先需要定位顶级页表 PGD 中的页目录项 pgd_t，pgd_t 指向的 PUD 的起始内存地址，然后在定位 PUD 中的页目录项 pud_t，后面的流程就和二级页表一样了。
+
+![memory](./images/memory88.png)
+
+```c
+typedef unsigned long	pteval_t;
+typedef unsigned long	pmdval_t;
+typedef unsigned long	pudval_t;
+typedef unsigned long	pgdval_t;
+
+/* 内核这里使用 struct 结构来包裹 unsigned long 类型的目的是要确保这些页目录项以及页表项只能被专门的辅助函数访问，
+ * 不能直接访问。
+ */
+typedef struct { pteval_t pte; } pte_t;
+typedef struct { pmdval_t pmd; } pmd_t;
+typedef struct { pudval_t pud; } pud_t;
+typedef struct { pgdval_t pgd; } pgd_t;
+```
+
+一张页表 4K 大小，页表中的一个 PTE 占用 8 个字节，所以在 64 位系统中一张页表只能包含 512 个 PTE，在内核中使用 `PTRS_PER_PTE` 常量来表示一张页表中可以容纳的 PTE 个数，用 `PAGE_SHIFT` 常量表示一个物理内存页的大小：2^PAGE_SHIFT。
+
+```c
+/*
+ * entries per page directory level
+ */
+#define PTRS_PER_PTE	512
+
+/* PAGE_SHIFT determines the page size */
+#define PAGE_SHIFT		12
+```
+
+要寻址页表中这 512 个 PTE，用 9 个 bit 就可以了，因此虚拟内存地址中的 `一级页表中的 PTE 偏移` 占用 9 个 bit 位。而一个 PTE 可以映射 4K 大小的物理内存（一个物理内存页），所以在 64 位的四级页表体系下，一张一级页表可以映射的物理内存空间大小为 2M 大小。
+
+![memory](./images/memory89.png)
+
+一张中间页目录 PMD 也是 4K 大小，PMD 中的页目录项 pmd_t 也是占用 8 个字节，所以一张 PMD 中只能容纳 512 个 pmd_t，内核中使用 `PTRS_PER_PMD` 常量来表示 PMD 中可以容纳多少个页目录项 pmd_t。因次 64 位虚拟内存地址中的 `PMD中的页目录偏移` 使用 9 个 bit 就可以表示了。
+
+```c
+/*
+ * PMD_SHIFT determines the size of the area a middle-level
+ * page table can map
+ */
+#define PMD_SHIFT	21
+#define PTRS_PER_PMD	512
+```
+
+而一个 pmd_t 指向一张一级页表，所以一个 pmd_t 可以映射的物理内存为 2M，内核中使用 `PMD_SHIFT` 常量来表示一个 pmd_t 可以映射的物理内存范围：2^PMD_SHIFT。一张 PMD 可以映射 1G 的物理内存。
+
+![memory](./images/memory90.png)
+
+一张上层页目录 PUD 中可以容纳 512 个页目录项 pud_t，内核中使用 `PTRS_PER_PUD` 常量来表示 PUD 中可以容纳多少个页目录项 pud_t。 64 位虚拟内存地址中的 `PUD中的页目录偏移` 也是使用 9 个 bit 就可以表示了。
+
+```c
+/*
+ * 3rd level page
+ */
+#define PUD_SHIFT	30
+#define PTRS_PER_PUD	512
+```
+
+内核中使用 `PUD_SHIFT` 常量来表示一个 pud_t 可以映射的物理内存范围：2^PUD_SHIFT，一个 pud_t 指向一张 PMD，因此可以映射 1G 的物理内存。一张 PUD 可以映射 512G 的物理内存。
+
+![memory](./images/memory91.png)
+
+顶级页目录 PGD 中可以容纳的页目录 pgd_t 个数 `PTRS_PER_PGD = 512`， 64 位虚拟内存地址中的 `PGD中的页目录偏移` 也是使用 9 个 bit 就可以表示了，一个 pgd_t 可以映射的物理内存为 2^PGDIR_SHIFT = `512 G`。一张 PGD 可以映射的物理内存为 256 T。
+
+```c
+/*
+ * 4th level page in 5-level paging case
+ */
+#define PGDIR_SHIFT		39
+#define PTRS_PER_PGD		512
+```
+
+![memory](./images/memory92.png)
+
+- PAGE_SHIFT 用来表示页表中的一个 PTE 可以映射的物理内存大小（4K）。
+- PMD_SHIFT 用来表示 PMD 中的一个页目录项 pmd_t 可以映射的物理内存大小（2M）。
+- PUD_SHIFT 用来表示 PUD 中的一个页目录项 pud_t 可以映射的物理内存大小（1G）。
+- PGD_SHIFT 用来表示 PGD 中的一个页目录项 pgd_t 可以映射的物理内存大小（512G）。
+
+这些 XXX_SHIFT 常量在内核中除了可以表示对应页目录项映射的物理内存大小之外，还可以从一个 64 位虚拟内存地址中获取其在对应页目录中的偏移。比如需要从一个 64 位虚拟内存地址中获取它在 PGD 中的偏移，可以讲虚拟内存地址右移 PGD_SHIFT 位来得到：
+
+```c
+#define pgd_index(address) ( address >> PGDIR_SHIFT) 
+```
+
+然后可以通过 PGD 的起始内存地址加上 `pgd_index` 就可以得到虚拟内存地址在 PGD 中的页目录项 pgd_t 了。
+
+```c
+#define pgd_offset_pgd(pgd, address) (pgd + pgd_index((address)))
+```
+
+同样的道理，可以将虚拟内存地址右移 PUD_SHIFT 位，并用掩码 `PTRS_PER_PUD - 1` 掩掉高 9 位 , 只保留低 9 位，就可以得到虚拟内存地址在 PUD 中的偏移了：
+
+```c
+// PTRS_PER_PUD - 1 转换为二进制是 9 个 1，用来截取最低的 9 个比特位。
+static inline unsigned long pud_index(unsigned long address)
+{
+	return (address >> PUD_SHIFT) & (PTRS_PER_PUD - 1);
+}
+```
+
+通过 pgd_t 获取 PUD 的起始内存地址 + `pud_index` 得到虚拟内存地址对应的 pud_t：
+
+```c
+/* Find an entry in the third-level page table.. */
+static inline pud_t *pud_offset(pgd_t *pgd, unsigned long address)
+{
+	return (pud_t *)pgd_page_vaddr(*pgd) + pud_index(address);
+}
+```
+
+根据相同的计算逻辑，可以通过 pmd_offset 函数获取虚拟内存地址在 PMD 中的页目录项 pmd_t：
+
+```c
+/* Find an entry in the second-level page table.. */
+static inline pmd_t *pmd_offset(pud_t *pud, unsigned long address)
+{
+	return (pmd_t *)pud_page_vaddr(*pud) + pmd_index(address);
+}
+
+static inline unsigned long pmd_index(unsigned long address)
+{
+	return (address >> PMD_SHIFT) & (PTRS_PER_PMD - 1);
+}
+```
+
+通过 pte_offset_kernel 函数可以获取虚拟内存地址在一级页表中的 PTE：
+
+```c
+static inline pte_t *pte_offset_kernel(pmd_t *pmd, unsigned long address)
+{
+	return (pte_t *)pmd_page_vaddr(*pmd) + pte_index(address);
+}
+
+static inline unsigned long pte_index(unsigned long address)
+{
+	return (address >> PAGE_SHIFT) & (PTRS_PER_PTE - 1);
+}
+```
+
+![memory](./images/memory93.png)
+
+1. 首先 MMU 会从 CR3/TTBR 寄存器中获取顶级页目录 PGD 的起始内存地址，然后通过 pgd_index 从虚拟内存地址中截取 `PGD 中的页目录项偏移`，这样就定位到了具体的一个 pgd_t。
+2. pgd_t 中保存的是 PMD 的起始内存地址，通过 pud_index 可以从虚拟内存地址中截取 `PUD 中的页目录项偏移`，从而确定虚拟内存地址在 PUD 中的页目录项 pud_t。
+3. 同样的道理，根据 pud_t 中保存的 PMD 其实内存地址，在加上通过 pmd_index 获取到的 `PMD 中的页目录项偏移`，定位到虚拟内存地址在 PMD 中的页目录项 pmd_t。
+4. 后面的寻址流程就和二级页表一样了，pmd_t 指向具体页表的起始内存地址，通过 pte_index 截取虚拟内存地址在 `一级页表中的 PTE 偏移`，最终定位到一个具体的 PTE 中，PTE 指向的正是虚拟内存地址映射的物理内存页面，然后通过虚拟内存地址中的低 12 位（物理内存页内偏移），最终确定到一个具体的物理字节上。
+
+![memory](./images/memory94.png)
+
+以 36 位物理内存地址（最多 52 位）为例进行说明，首先物理内存页的起始内存地址都是按照 4K 对齐的，所以 36 位物理内存地址的低 12 位全部为 0 ，和 32 位的 PTE 一样，内核可以用这低 12 位来描述 PTE 的权限位，其中 0 到 8 之间的比特位，在 32 位 PTE 和 64 位 PTE 中含义都是一样的。
+
+`R(11)` 这里的 R 表示 restart，该比特位主要用于 HLAT paging，当遍历到 R 位是 1 的 PTE 时，MMU 会重新从 CR3/TTBR 寄存器开始遍历页表。
+
+本例中的物理内存地址是 36 位的，由于物理内存页都是 4K 对齐的，低 12 位全都是 0 ，因此只需要在 PTE 中存储物理内存地址的高 24 位即可，这部分存储在 PTE 中的第 12 到 35 比特位。
+
+`Reserved(51:36)` 这些是预留位，全部设置为 0 。
+
+`Protection(62:59)` 这 4 个比特位用于对物理内存页的访问进行控制。
+
+`XD(63)` 该比特位是 64 位 PTE 中新增的，32 位 PTE 中是没有的，值为 1 表示该 PTE 所映射的物理内存页面中的数据是可以被执行的。
+
+![memory](./images/memory95.png)
+
+当 64 位 PDE 的 `PS(7)` 比特位为 0 时，该 PDE 指向的是其下一级页目录或者页表的起始内存地址。当 64 位 PDE 的 `PS(7)` 比特位为 1 时，该 PDE 指向的就是一个内存大页，对于 PMD 中的页目录项 pmd_t 而言，它指向的是一张 2M 大小的物理内存大页。
+
+![memory](./images/memory96.png)
+
+对于 PUD 中的页目录项 pud_t 而言，它指向的是一张 1G 大小的物理内存大页。
+
+![memory](./images/memory97.png)
+
+当 64 位 PDE 的 PS(7) 比特位为 1 时，这些页目录项 PDE 就被当做了一个特殊的 ”PTE“ 对待了，因此 PDE 中的比特位布局又就变成了 64 位 PTE 中的样子了。
+
+![memory](./images/memory98.png)
+
+第 12 到 35 比特位直接标注为了存储大页内存的地址，但事实上，大页内存的地址并不需要这么多位来存储，因为大页中的内存容量比较大，所以大页个数相对较少，它们的起始内存地址不会特别高，使用小于 24 位的比特就可以存放了，多出来的比特位被用作其他目的。内核当然也会提供一系列的辅助函数来对页目录进行操作：
+
+- pgd_alloc，pud_alloc，pmd_alloc 负责创建初始化对应的页目录。
+- mk_pgd，mk_pud，mk_pmd，mk_pte 用于创建相应页目录项和页表项，并初始化上述比特位。
+- 以及提供相关 pgd_xxx，pud_xxx，pmd_xxx 等形式的辅助函数，用于对相关比特位的增删改查操作。
+
+#### CPU 寻址过程
+
+地址翻译的过程需要的步骤还是比较多的，而 CPU 访问内存的操作是非常非常频繁的，如果采用内核这种软件的方式对页表进行遍历，效率会非常的差。而采用一种专门的硬件来对软件进行加速，无疑是一种最简单，最直接有效的优化手段，于是在 CPU 中引入了一个专门对页表进行遍历的地址翻译硬件 MMU（Memory Management Unit），有了 MMU 硬件的加持整个地址翻译的过程就非常的快了。
+
+![memory](./images/memory99.png)
+
+页目录表和页表中那些经常被 MMU 遍历到的页目录项 PDE，页表项 PTE 均会缓存在 CPU 的 CACHE 中，这样 MMU 就可以直接从 CPU 高速缓存中获取 PDE , PTE 了，近一步加速了整个地址翻译的过程。
+
+当 MMU 拿到一个 CPU 正在访问的虚拟内存地址之后， MMU 首先会从 CR3/TTBR 寄存器中获取顶级页目录表 PGD 的起始内存地址，然后从虚拟内存地址中提取出 pgd_index，从而定位到 PGD 中的一个页目录项 pdg_t，MMU 首先会从 CPU 的高速缓存中去获取这个 pgd_t，如果 pgd_t 经常被访问到，那么此时它已经存在于高速缓存中了，MMU 直接可以进行下一级页目录的地址翻译操作，避免了慢速的内存访问。同样的道理，在 MMU 经过层层的页目录遍历之后，终于定位到了一级页表中的 PTE，MMU 也是先会从 CPU 高速缓存中去获取 PTE，如果 PTE 不在高速缓存中，MMU 才会去内存中去获取。获取到 PTE 之后，MMU 就得到了虚拟内存地址背后映射的物理内存地址了。
+
+![memory](./images/memory100.png)
+
+在引入 MMU 之后，虽然加快了整个页表遍历的过程，但是 CPU 每访问一个虚拟内存地址，MMU 还是需要查找一次 PTE，即便是最好的情况，MMU 也还是需要到 CPU 高速缓存中去找一下的，即便这样开销已经很小了，但是还是想近一步降低这个访问 CPU CACHE 的开销，让 CPU 访存性能达到极致。既然 MMU 每次都需要查找一次 PTE，那么能不能在 MMU 中引入一层硬件缓存，这样 MMU 可以把查找到的 PTE 缓存在硬件中，下次再需要的时候直接到硬件缓存中拿现成的 PTE 就可以了，这样一来，CPU 的访存效率又被近一步加快了。这个 MMU 中的硬件缓存就叫做 TLB(Translation Lookaside Buffer)，TLB 是一个非常小的，虚拟寻址的硬件缓存，专门用来缓存被 MMU 翻译之后的热点 PTE。引入 TLB 之后，整个寻址过程就又有了一些新的变化：
+
+![memory](./images/memory101.png)
+
+当 CPU 将要访问的虚拟内存地址送到 MMU 中翻译时，MMU 首先会在 TLB 中通过虚拟内存寻址查找其对应的 PTE 是否缓存在 TLB 中，如果 cache hit ，那么 MMU 就可以直接获得现成的 PTE，避免了漫长的地址翻译过程。如果 cache miss，那么 MMU 就需要重新遍历页表，然后获取 PTE 的内存地址，从 CPU 高速缓存或者内存中去查找 PTE，慢速路径下获取到 PTE 之后，MMU 会将 PTE 缓存到 TLB 中，加快下一次获取 PTE 的速度。当 MMU 获取到 PTE 之后，就可以从 PTE 中拿到物理内存页的起始地址了，在加上虚拟内存地址的低 12 位（物理内存页内偏移）这样就获取到了虚拟内存地址映射的物理内存地址了。
 
 ![mmu](./images/mmu.png)
-
-#### **Page Table**
-
-page table是每个进程独有的，是软件实现的，是存储在main memory（比如DDR）中的。
-
-#### Address Translation
-
-因为访问内存中的页表相对耗时，尤其是在现在普遍使用多级页表的情况下，需要多次的内存访问，为了加快访问速度，给page table设计了一个硬件缓存 - **TLB**，CPU会首先在TLB中查找，因为在TLB中找起来很快。TLB之所以快，一是因为它含有的entries的数目较少，二是TLB是集成进CPU的，它几乎可以按照CPU的速度运行。
-
-如果在TLB中找到了含有该虚拟地址的entry（TLB hit），则可从该entry中直接获取对应的物理地址，否则就不幸地TLB miss了，就得去查找当前进程的page table。这个时候，组成MMU的另一个部分table walk unit就被召唤出来了，这里面的table就是page table。
-
-使用table walk unit硬件单元来查找page table的方式被称为hardware TLB miss handling，通常被CISC架构的处理器（比如IA-32）所采用。它要在page table中查找不到，出现page fault的时候才会交由软件（操作系统）处理。
-
-与之相对的通常被RISC架构的处理器（比如Alpha）采用的software TLB miss handling，TLB miss后CPU就不再参与了，由操作系统通过软件的方式来查找page table。使用硬件的方式更快，而使用软件的方式灵活性更强。IA-64提供了一种混合模式，可以兼顾两者的优点。
-
-如果在page table中找到了该虚拟地址对应的entry的p（present）位是1，说明该虚拟地址对应的物理页面当前驻留在内存中，也就是page table hit。找到了还没完，接下来还有两件事要做：
-
-1. 既然是因为在TLB里找不到才找到这儿来的，自然要更新TLB。
-2. 进行权限检测，包括可读/可写/可执行权限，user/supervisor模式权限等。如果没有正确的权限，将触发SIGSEGV（Segmantation Fault）。
-
-如果该虚拟地址对应的entry的p位是0，就会触发page fault，可能有这几种情况：
-
-1. 这个虚拟地址被分配后还从来没有被access过（比如malloc之后还没有操作分配到的空间，则不会真正分配物理内存）。触发page fault后分配物理内存，也就是demand paging，有了确定的demand了之后才分，然后将p位置1。
-2. 对应的这个物理页面的内容被换出到外部的disk/flash了，这个时候page table entry里存的是换出页面在外部swap area里暂存的位置，可以将其换回物理内存，再次建立映射，然后将p位置1。
 
 ![mmu](./images/address_translation.png)
 
@@ -3085,3 +3581,4782 @@ cache中没有匹配的tag，cache miss
 ![](./images/address_translation_example19.png)
 
 ![](./images/address_translation2.png)
+
+### mmap
+
+```c
+#include <sys/mman.h>
+void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset);
+
+// arch/arm64/kernel/sys.c
+SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
+		unsigned long, prot, unsigned long, flags,
+		unsigned long, fd, unsigned long, off)
+```
+
+mmap 内存映射里所谓的内存其实指的是虚拟内存，在调用 mmap 进行匿名映射的时候（比如进行堆内存的分配），是将进程虚拟内存空间中的某一段虚拟内存区域与物理内存中的匿名内存页进行映射，当调用 mmap 进行文件映射的时候，是将进程虚拟内存空间中的某一段虚拟内存区域与磁盘中某个文件中的某段区域进行映射。
+
+- addr ： 表示要映射的这段虚拟内存区域在进程虚拟内存空间中的起始地址（虚拟内存地址），但是这个参数只是给内核的一个暗示，内核并非一定得从我们指定的 addr 虚拟内存地址上划分虚拟内存区域，内核只不过在划分虚拟内存区域的时候会优先考虑用户指定的 addr，如果这个虚拟地址已经被使用或者是一个无效的地址，那么内核则会自动选取一个合适的地址来划分虚拟内存区域。用户一般会将 addr 设置为 NULL，意思就是完全交由内核来决定虚拟映射区的起始地址。
+  - length ：如果是匿名映射，length 参数决定了要映射的匿名物理内存有多大，如果是文件映射，length 参数决定了要映射的文件区域有多大。
+
+addr，length 必须要按照 PAGE_SIZE（4K） 对齐
+
+![memory](./images/memory102.png)
+
+如果通过 mmap 映射的是磁盘上的一个文件，那么就需要通过参数 fd 来指定要映射文件的描述符（file descriptor），通过参数 offset 来指定文件映射区域在文件中偏移。在内存管理系统中，物理内存是按照内存页为单位组织的，在文件系统中，磁盘中的文件是按照磁盘块为单位组织的，内存页和磁盘块大小一般情况下都是 4K 大小，所以这里的 offset 也必须是按照 4K 对齐的。而在文件映射与匿名映射区中的这一段一段的虚拟映射区，其实本质上也是虚拟内存区域，它们和进程虚拟内存空间中的代码段，数据段，BSS 段，堆，栈没有任何区别，在内核中都是 `struct vm_area_struct` 结构来表示的，进程空间中的这些虚拟内存区域统称为 VMA。
+
+mmap 系统调用的本质是首先要在进程虚拟内存空间里的文件映射与匿名映射区中划分出一段虚拟内存区域 VMA 出来 ，这段 VMA 区域的大小用 vm_start，vm_end 来表示，它们由 mmap 系统调用参数 addr，length 决定。
+
+```c
+struct vm_area_struct {
+    unsigned long vm_start;     /* Our start address within vm_mm. */
+    unsigned long vm_end;       /* The first byte after our end address */
+}
+```
+
+随后内核会对这段 VMA 进行相关的映射，如果是文件映射的话，内核会将要映射的文件，以及要映射的文件区域在文件中的 offset，与 VMA 结构中的 `vm_file`，`vm_pgoff` 关联映射起来，它们由 mmap 系统调用参数 fd，offset 决定。
+
+```c
+struct vm_area_struct {
+    struct file * vm_file;      /* File we map to (can be NULL). */
+    unsigned long vm_pgoff;     /* Offset (within vm_file) in PAGE_SIZE */
+}
+```
+
+另外由 mmap 在文件映射与匿名映射区中映射出来的这一段虚拟内存区域同进程虚拟内存空间中的其他虚拟内存区域一样，也都是有权限控制的。
+
+- 进程虚拟内存空间中的代码段，它是与磁盘上 ELF 格式可执行文件中的 .text section（磁盘文件中各个区域的单元组织结构）进行映射的，存放的是程序执行的机器码，所以在可执行文件与进程虚拟内存空间进行文件映射的时候，需要指定代码段这个虚拟内存区域的权限为可读（VM_READ），可执行的（VM_EXEC）。
+- 数据段也是通过文件映射进来的，内核会将磁盘上 ELF 格式可执行文件中的 .data section 与数据段映射起来，在映射的时候需要指定数据段这个虚拟内存区域的权限为可读（VM_READ），可写（VM_WRITE）。
+- 与代码段和数据段不同的是，BSS段，堆，栈这些虚拟内存区域并不是从磁盘二进制可执行文件中加载的，它们是通过匿名映射的方式映射到进程虚拟内存空间的。BSS 段中存放的是程序未初始化的全局变量，这段虚拟内存区域的权限是可读（VM_READ），可写（VM_WRITE）。
+- 堆是用来描述进程在运行期间动态申请的虚拟内存区域的，所以堆也会具有可读（VM_READ），可写（VM_WRITE）权限，在有些情况下，堆也具有可执行（VM_EXEC）的权限，比如 Java 中的字节码存储在堆中，所以需要可执行权限。
+- 栈是用来保存进程运行时的命令行参，环境变量，以及函数调用过程中产生的栈帧的，栈一般拥有可读（VM_READ），可写（VM_WRITE）的权限，但是也可以设置可执行（VM_EXEC）权限，不过出于安全的考虑，很少这么设置。
+
+ mmap 系统调用中的参数 prot 来指定其在进程虚拟内存空间中映射出的这段虚拟内存区域 VMA 的访问权限，它的取值有如下四种：
+
+```c
+#define PROT_READ	0x1		/* page can be read */
+#define PROT_WRITE	0x2		/* page can be written */
+#define PROT_EXEC	0x4		/* page can be executed */
+#define PROT_NONE	0x0		/* page can not be accessed */
+```
+
+- PROT_READ 表示该虚拟内存区域背后映射的物理内存是可读的。
+- PROT_WRITE 表示该虚拟内存区域背后映射的物理内存是可写的。
+- PROT_EXEC 表示该虚拟内存区域背后映射的物理内存所存储的内容是可以被执行的，该内存区域内往往存储的是执行程序的机器码，比如进程虚拟内存空间中的代码段，以及动态链接库通过文件映射的方式加载进文件映射与匿名映射区里的代码段，这些 VMA 的权限就是 PROT_EXEC 。
+- PROT_NONE 表示这段虚拟内存区域是不能被访问的，既不可读写，也不可执行。用于实现防范攻击的 guard page。如果攻击者访问了某个 guard page，就会触发 SIGSEV 段错误。除此之外，指定 PROT_NONE 还可以为进程预先保留这部分虚拟内存区域，虽然不能被访问，但是当后面进程需要的时候，可以通过 mprotect 系统调用修改这部分虚拟内存区域的权限。
+
+mprotect 系统调用可以动态修改进程虚拟内存空间中任意一段虚拟内存区域的权限。
+
+除了要为 mmap 映射出的这段虚拟内存区域 VMA 指定访问权限之外，还需要为这段映射区域 VMA 指定映射方式，VMA 的映射方式由 mmap 系统调用参数 flags 决定，内核为 flags 定义了数量众多的枚举值。
+
+```c
+#define MAP_FIXED   0x10        /* Interpret addr exactly */
+#define MAP_ANONYMOUS   0x20    /* don't use a file */
+
+#define MAP_SHARED  0x01        /* Share changes */
+#define MAP_PRIVATE 0x02        /* Changes are private */
+```
+
+mmap 系统调用的 addr 参数，这个参数只是一个暗示并非是强制性的，表示希望内核可以根据指定的虚拟内存地址 addr 处开始创建虚拟内存映射区域 VMA。但如果指定的 addr 是一个非法地址，比如 `[addr , addr + length]` 这段虚拟内存地址已经存在映射关系了，那么内核就会自动选取一个合适的虚拟内存地址开始映射。但是在 mmap 系统调用的参数 flags 中指定了 `MAP_FIXED`, 这时参数 addr 就变成强制要求了，如果 `[addr , addr + length]` 这段虚拟内存地址已经存在映射关系了，那么内核就会将这段映射关系 unmmap 解除掉映射，然后重新根据用户的要求进行映射，如果 addr 是一个非法地址，内核就会报错停止映射。
+
+将 mmap 系统调用参数 flags 指定为 `MAP_ANONYMOUS` 时，表示需要进行匿名映射，既然是匿名映射，fd 和 offset 这两个参数也就没有了意义，fd 参数需要被设置为 -1 。当进行文件映射的时候，只需要指定 fd 和 offset 参数就可以了。
+
+根据 mmap 创建出的这片虚拟内存区域背后所映射的**物理内存**能否在多进程之间共享，又分为了两种内存映射方式：
+
+- `MAP_SHARED` 表示共享映射，通过 mmap 映射出的这片内存区域在多进程之间是共享的，一个进程修改了共享映射的内存区域，其他进程是可以看到的，用于多进程之间的通信。
+- `MAP_PRIVATE` 表示私有映射，通过 mmap 映射出的这片内存区域是进程私有的，其他进程是看不到的。如果是私有文件映射，那么多进程针对同一映射文件的修改将不会回写到磁盘文件上
+
+#### 私有匿名映射
+
+`MAP_PRIVATE | MAP_ANONYMOUS` 表示私有匿名映射，通常利用这种映射方式来申请虚拟内存，比如使用 glibc 库里封装的 malloc 函数进行虚拟内存申请时，当申请的内存大于 128K 的时候，malloc 就会调用 mmap 采用私有匿名映射的方式来申请堆内存。因为它是私有的，所以申请到的内存是进程独占的，多进程之间不能共享。mmap 私有匿名映射申请到的只是虚拟内存，内核只是在进程虚拟内存空间中划分一段虚拟内存区域 VMA 出来，并将 VMA 该初始化的属性初始化好，mmap 系统调用就结束了。
+
+当进程开始访问这段虚拟内存区域时，发现这段虚拟内存区域背后没有任何物理内存与其关联，体现在内核中就是这段虚拟内存地址在页表中的 PTE 项是空的。这时 MMU 就会触发缺页异常（page fault），这里的缺页指的就是缺少物理内存页，随后进程就会切换到内核态，在内核缺页中断处理程序中，为这段虚拟内存区域分配对应大小的物理内存页，随后将物理内存页中的内容全部初始化为 0 ，最后在页表中建立虚拟内存与物理内存的映射关系，缺页异常处理结束。当缺页处理程序返回时，CPU 会重新启动引起本次缺页异常的访存指令，这时 MMU 就可以正常翻译出物理内存地址了。
+
+mmap 的私有匿名映射还会应用在 execve 系统调用中，execve 用于在当前进程中加载并执行一个新的二进制执行文件：
+
+```c
+#include <unistd.h>
+
+// 参数 filename 指定新的可执行文件的文件名，argv 用于传递新程序的命令行参数，envp 用来传递环境变量。
+int execve(const char* filename, const char* argv[], const char* envp[])
+```
+
+既然是在当前进程中重新执行一个程序，那么当前进程的用户态虚拟内存空间就没有用了，内核需要根据这个可执行文件重新映射进程的虚拟内存空间。既然现在要重新映射进程虚拟内存空间，内核首先要做的就是删除释放旧的虚拟内存空间，并清空进程页表。然后根据 filename 打开可执行文件，并解析文件头，判断可执行文件的格式，不同的文件格式需要不同的函数进行加载。
+
+linux 中支持多种可执行文件格式，比如，elf 格式，a.out 格式。内核中使用 `struct linux_binfmt` 结构来描述可执行文件，里边定义了用于加载可执行文件的函数指针 `load_binary`，加载动态链接库的函数指针 `load_shlib`，不同文件格式指向不同的加载函数：
+
+```c
+static struct linux_binfmt elf_format = {
+	.module		= THIS_MODULE,
+	.load_binary	= load_elf_binary,
+	.load_shlib	= load_elf_library,
+	.core_dump	= elf_core_dump,
+	.min_coredump	= ELF_EXEC_PAGESIZE,
+};
+
+static struct linux_binfmt aout_format = {
+	.module		= THIS_MODULE,
+	.load_binary	= load_aout_binary,
+	.load_shlib	= load_aout_library,
+};
+```
+
+在 `load_binary` 中会解析对应格式的可执行文件，并根据文件内容重新映射进程的虚拟内存空间。比如，虚拟内存空间中的 BSS 段，堆，栈这些内存区域中的内容不依赖于可执行文件，所以在 `load_binary` 中采用私有匿名映射的方式来创建新的虚拟内存空间中的 BSS 段，堆，栈。BSS 段虽然定义在可执行二进制文件中，不过只是在文件中记录了 BSS 段的长度，并没有相关内容关联，所以 BSS 段也会采用私有匿名映射的方式加载到进程虚拟内存空间中。
+
+![memory](./images/memory103.png)
+
+#### 私有文件映射
+
+调用 mmap 进行内存文件映射的时候可以通过指定参数 flags 为 `MAP_PRIVATE`，然后将参数 fd 指定为要映射文件的文件描述符（file descriptor）来实现对文件的私有映射。假设现在磁盘上有一个名叫 file-read-write.txt 的磁盘文件，现在多个进程采用私有文件映射的方式，从文件 offset 偏移处开始，映射 length 长度的文件内容到各个进程的虚拟内存空间中，调用完 mmap 之后，相关内存映射内核数据结构关系如下图所示：
+
+![memory](./images/memory104.png)
+
+当进程打开一个文件的时候，内核会为其创建一个 `struct file` 结构来描述被打开的文件，并在进程文件描述符列表 `fd_array` 数组中找到一个空闲位置分配给它，数组中对应的下标，就是在用户空间用到的文件描述符。
+
+![memory](./images/memory105.png)
+
+`struct file` 结构是和进程相关的（ fd 的作用域也是和进程相关的），即使多个进程打开同一个文件，那么内核会为每一个进程创建一个 `struct file` 结构，如上图中所示，进程 1 和 进程 2 都打开了同一个 file-read-write.txt 文件，那么内核会为进程 1 创建一个 `struct file` 结构，也会为进程 2 创建一个 `struct file` 结构。每一个磁盘上的文件在内核中都会有一个唯一的 `struct inode` 结构，inode 结构和进程是没有关系的，一个文件在内核中只对应一个 inode，inode 结构用于描述文件的元信息，比如，文件的权限，文件中包含多少个磁盘块，每个磁盘块位于磁盘中的什么位置等等。
+
+```c
+// ext4 文件系统中的 inode 结构
+struct ext4_inode {
+   // 文件权限
+  __le16  i_mode;    /* File mode */
+  // 文件包含磁盘块的个数
+  __le32  i_blocks_lo;  /* Blocks count */
+  // 存放文件包含的磁盘块
+  __le32  i_block[EXT4_N_BLOCKS];/* Pointers to blocks */
+};
+```
+
+在文件系统中，Linux 是按照磁盘块为单位对磁盘中的数据进行管理的，它们的大小也是 4K 。如下图所示，磁盘盘面上一圈一圈的同心圆叫做磁道，磁盘上存储的数据就是沿着磁道的轨迹存放着，随着磁盘的旋转，磁头在磁道上读写硬盘中的数据。而在每个磁盘上，会进一步被划分成多个大小相等的圆弧，这个圆弧就叫做扇区，磁盘会以扇区为单位进行数据的读写。每个扇区大小为 512 字节。
+
+![memory](./images/memory106.png)
+
+而在 Linux 的文件系统中是按照磁盘块为单位对数据读写的，因为每个扇区大小为 512 字节，能够存储的数据比较小，而且扇区数量众多，这样在寻址的时候比较困难，Linux 文件系统将相邻的扇区组合在一起，形成一个磁盘块，后续针对磁盘块整体进行操作效率更高。只要找到了文件中的磁盘块，就可以寻址到文件在磁盘上的存储内容了，所以使用 mmap 进行内存文件映射的本质就是建立起虚拟内存区域 VMA 到文件磁盘块之间的映射关系 。
+
+![memory](./images/memory107.png)
+
+调用 mmap 进行内存文件映射的时候，内核首先会在进程的虚拟内存空间中创建一个新的虚拟内存区域 VMA 用于映射文件，通过 `vm_area_struct->vm_file` 将映射文件的 `struct flle` 结构与虚拟内存映射关联起来。
+
+```c
+struct vm_area_struct {
+    struct file * vm_file;      /* File we map to (can be NULL). */
+    unsigned long vm_pgoff;     /* Offset (within vm_file) in PAGE_SIZE */
+}
+```
+
+通过 `vm_file->f_inode` 可以关联到映射文件的 `struct inode`，近而关联到映射文件在磁盘中的磁盘块 `i_block`，**这个就是 mmap 内存文件映射最本质的东西**。
+
+站在文件系统的视角，映射文件中的数据是按照磁盘块来存储的，读写文件数据也是按照磁盘块为单位进行的，磁盘块大小为 4K，当进程读取磁盘块的内容到内存之后，站在内存管理系统的视角，磁盘块中的数据被 DMA 拷贝到了物理内存页中，这个物理内存页就是前面提到的文件页。根据程序的时间局部性原理，磁盘文件中的数据一旦被访问，那么它很有可能在短期内被再次访问，所以为了加快进程对文件数据的访问，内核会将已经访问过的磁盘块缓存在文件页中。
+
+一个文件包含多个磁盘块，当它们被读取到内存之后，一个文件也就对应了多个文件页，这些文件页在内存中统一被一个叫做 page cache 的结构所组织。每一个文件在内核中都会有一个唯一的 page cache 与之对应，用于缓存文件中的数据，page cache 是和文件相关的，它和进程是没有关系的，多个进程可以打开同一个文件，每个进程中都有有一个 `struct file` 结构来描述这个文件，但是一个文件在内核中只会对应一个 page cache。文件的 `struct inode` 结构中除了有磁盘块的信息之外，还有指向文件 page cache 的 `i_mapping` 指针。
+
+```c
+struct inode {
+    struct address_space	*i_mapping;
+}
+
+// page cache 在内核中是使用 struct address_space 结构来描述的
+struct address_space {
+    // 文件页是挂在 radix_tree 的叶子结点上，radix_tree 中的 root 节点和 node 节点是文件页（叶子节点）的索引节点。
+    struct radix_tree_root  page_tree; 
+}
+```
+
+当多个进程调用 mmap 对磁盘上同一个文件进行私有文件映射的时候，内核只是在每个进程的虚拟内存空间中创建出一段虚拟内存区域 VMA 出来，注意，此时内核只是为进程申请了用于映射的虚拟内存，并将虚拟内存与文件映射起来，mmap 系统调用就返回了，全程并没有物理内存的影子出现。文件的 page cache 也是空的，没有包含任何的文件页。当任意一个进程开始访问这段映射的虚拟内存时，CPU 会把虚拟内存地址送到 MMU 中进行地址翻译，因为 mmap 只是为进程分配了虚拟内存，并没有分配物理内存，所以这段映射的虚拟内存在页表中是没有页表项 PTE 的。随后 MMU 就会触发缺页异常（page fault），进程切换到内核态，在内核缺页中断处理程序中会发现引起缺页的这段 VMA 是私有文件映射的，所以内核会首先通过 `vm_area_struct->vm_pgoff` 在文件 page cache 中查找是否有缓存相应的文件页（映射的磁盘块对应的文件页）。
+
+```c
+struct vm_area_struct {
+    unsigned long vm_pgoff;     /* Offset (within vm_file) in PAGE_SIZE */
+}
+
+static inline struct page *find_get_page(struct address_space *mapping,
+     pgoff_t offset)
+{
+	return pagecache_get_page(mapping, offset, 0, 0);
+}
+
+static const struct address_space_operations ext4_aops = {
+    .readpage       = ext4_readpage
+}
+```
+
+如果文件页不在 page cache 中，内核则会在物理内存中分配一个内存页，然后将新分配的内存页加入到 page cache 中，并增加页引用计数。随后会通过 `address_space_operations` 重定义的 readpage 激活块设备驱动从磁盘中读取映射的文件内容，然后将读取到的内容填充新分配的内存页。现在文件中映射的内容已经加载进 page cache 了，此时物理内存才正式登场，在缺页中断处理程序的最后一步，内核会为映射的这段虚拟内存在页表中创建 PTE，然后将虚拟内存与 page cache 中的文件页通过 PTE 关联起来，缺页处理就结束了，但是由于指定的私有文件映射，所以 PTE 中文件页的权限是只读的。当内核处理完缺页中断之后，mmap 私有文件映射在内核中的关系图就变成下面这样：
+
+![memory](./images/memory108.png)
+
+此时进程 1 中的页表已经建立起了虚拟内存与文件页的映射关系，进程 1 再次访问这段虚拟内存的时候，其实就等于直接访问文件的 page cache。整个过程是在用户态进行的，不需要切态。进程 2 和进程 1 一样，都是采用 mmap 私有文件映射的方式映射到了同一个文件中，虽然现在已经有了物理内存了（通过进程 1 的缺页产生），但是目前还和进程 2 没有关系。因为进程 2 的虚拟内存空间中这段映射的虚拟内存区域 VMA，在进程 2 的页表中还没有 PTE，所以当进程 2 访问这段映射虚拟内存时，同样会产生缺页中断，随后进程 2 切换到内核态，进行缺页处理，这里和进程 1 不同的是，此时被映射的文件内容已经加载到 page cache 中了，进程 2 只需要创建 PTE ，并将 page cache 中的文件页与进程 2 映射的这段虚拟内存通过 PTE 关联起来就可以了。同样，因为采用私有文件映射的原因，进程 2 的 PTE 也是只读的。现在进程 1 和进程 2 都可以根据各自虚拟内存空间中映射的这段虚拟内存对文件的 page cache 进行读取了，整个过程都发生在用户态，不需要切态，更不需要拷贝，因为虚拟内存现在已经直接映射到 page cache 了。
+
+![memory](./images/memory109.png)
+
+虽然是私有文件映射的方式，但是进程 1 和进程 2 如果只是对文件映射部分进行读取的话，文件页其实在多进程之间是共享的，整个内核中只有一份。但是当任意一个进程通过虚拟映射区对文件进行写入操作的时候，情况就发生了变化，虽然通过 mmap 映射的时候指定的这段虚拟内存是可写的，但是由于采用的是私有文件映射的方式，各个进程页表中对应 PTE 却是只读的，当进程对这段虚拟内存进行写入的时候，MMU 会发现 PTE 是只读的，所以会产生一个写保护类型的缺页中断，写入进程，比如是进程 1，此时又会陷入到内核态，在写保护缺页处理中，内核会重新申请一个内存页，然后将 page cache 中的内容拷贝到这个新的内存页中，进程 1 页表中对应的 PTE 会重新关联到这个新的内存页上，此时 PTE 的权限变为可写。
+
+![memory](./images/memory110.png)
+
+从此以后，进程 1 对这段虚拟内存区域进行读写的时候就不会再发生缺页了，读写操作都会发生在这个新申请的内存页上，但是有一点，进程 1 对这个内存页的任何修改均不会回写到磁盘文件上，这也体现了私有文件映射的特点，进程对映射文件的修改，其他进程是看不到的，并且修改不会同步回磁盘文件中。进程 2 对这段虚拟映射区进行写入的时候，也是一样的道理，同样会触发写保护类型的缺页中断，进程 2 陷入内核态，内核为进程 2 新申请一个物理内存页，并将 page cache 中的内容拷贝到刚为进程 2 申请的这个内存页中，进程 2 页表中对应的 PTE 会重新关联到新的内存页上，PTE 的权限变为可写。
+
+![memory](./images/memory111.png)
+
+这样一来，进程 1 和进程 2 各自的这段虚拟映射区，就映射到了各自专属的物理内存页上，而且这两个内存页中的内容均是文件中映射的部分，他们已经和 page cache 脱离了。进程 1 和进程 2 对各自虚拟内存区的修改只能反应到各自对应的物理内存页上，而且各自的修改在进程之间是互不可见的，最重要的一点是这些修改均不会回写到磁盘文件中，**这就是私有文件映射的核心特点**。
+
+![memory](./images/memory112.png)
+
+可以利用 mmap 私有文件映射这个特点来加载二进制可执行文件的 .text , .data section 到进程虚拟内存空间中的代码段和数据段中。因为同一份代码，也就是同一份二进制可执行文件可以运行多个进程，而代码段对于多进程来说是只读的，没有必要为每个进程都保存一份，多进程之间共享这一份代码就可以了，正好私有文件映射的读共享特点可以满足这个需求。对于数据段来说，虽然它是可写的，但是需要的是多进程之间对数据段的修改相互之间是不可见的，而且对数据段的修改不能回写到磁盘上的二进制文件中，在启动一个进程的时候，进程看到的就是数据段初始化未被修改的状态。 mmap 私有文件映射的写时复制（copy on write）以及修改不会回写到映射文件中等特点正好也满足需求。这一点可以在负责加载 elf 格式的二进制可执行文件并映射到进程虚拟内存空间的 `load_elf_binary` 函数，以及负责加载 a.out 格式可执行文件的 `load_aout_binary` 函数中可以看出。
+
+```c
+static int load_elf_binary(struct linux_binprm *bprm)
+{
+    ......
+    // 将二进制文件中的 .text .data section 私有映射到虚拟内存空间中代码段和数据段中
+    error = elf_map(bprm->file, load_bias + vaddr, elf_ppnt,
+        elf_prot, elf_flags, total_size);
+    ......
+}
+
+static int load_aout_binary(struct linux_binprm * bprm)
+{
+    ......
+    // 将 .text 采用私有文件映射的方式映射到进程虚拟内存空间的代码段
+    error = vm_mmap(bprm->file, N_TXTADDR(ex), ex.a_text,
+        PROT_READ | PROT_EXEC,
+        MAP_FIXED | MAP_PRIVATE | MAP_DENYWRITE | MAP_EXECUTABLE,
+        fd_offset);
+
+    // 将 .data 采用私有文件映射的方式映射到进程虚拟内存空间的数据段
+    error = vm_mmap(bprm->file, N_DATADDR(ex), ex.a_data,
+    	PROT_READ | PROT_WRITE | PROT_EXEC,
+        MAP_FIXED | MAP_PRIVATE | MAP_DENYWRITE | MAP_EXECUTABLE,
+        fd_offset + ex.a_text);
+    ......
+}
+```
+
+#### 共享文件映射
+
+将 mmap 系统调用中的 flags 参数指定为 `MAP_SHARED` , 参数 fd 指定为要映射文件的文件描述符（file descriptor）来实现对文件的共享映射。共享文件映射其实和私有文件映射前面的映射过程是一样的，唯一不同的点在于私有文件映射是读共享的，写的时候会发生写时复制（copy on write），并且多进程针对同一映射文件的修改不会回写到磁盘文件上。而共享文件映射因为是共享的，多个进程中的虚拟内存映射区最终会通过缺页中断的方式映射到文件的 page cache 中，后续多个进程对各自的这段虚拟内存区域的读写都会直接发生在 page cache 上。因为映射文件的 page cache 在内核中只有一份，所以对于共享文件映射来说，多进程读写都是共享的，由于多进程直接读写的是 page cache ，所以多进程对共享映射区的任何修改，最终都会通过内核回写线程 pdflush 刷新到磁盘文件中。下面这幅是多进程通过 mmap 共享文件映射之后的内核数据结构关系图：
+
+![memory](./images/memory113.png)
+
+同私有文件映射方式一样，当多个进程调用 mmap 对磁盘上的同一个文件进行共享文件映射的时候，内核中的处理都是一样的，也都只是在每个进程的虚拟内存空间中，创建出一段用于共享映射的虚拟内存区域 VMA 出来，随后内核会将各个进程中的这段虚拟内存映射区与映射文件关联起来，mmap 共享文件映射的逻辑就结束了。唯一不同的是，共享文件映射会在这段用于映射文件的 VMA 中标注是共享映射 —— `MAP_SHARED`。
+
+在 mmap 共享文件映射的过程中，内核同样不涉及任何的物理内存分配，只是分配了一段虚拟内存，在共享映射刚刚建立起来之后，文件对应的 page cache 同样是空的，没有包含任何的文件页。所以在各个进程的页表中，这段用于文件映射的虚拟内存区域对应的页表项 PTE 是空的，当任意进程对这段虚拟内存进行访问的时候（读或者写），MMU 就会产生缺页中断，这里以上图中的进程 1 为例，随后进程 1 切换到内核态，执行内核缺页中断处理程序。同私有文件映射的缺页处理一样，内核会首先通过 `vm_area_struct->vm_pgoff` 在文件 page cache 中查找是否有缓存相应的文件页（映射的磁盘块对应的文件页）。如果文件页不在 page cache 中，内核则会在物理内存中分配一个内存页，然后将新分配的内存页加入到 page cache 中。然后调用 readpage 激活块设备驱动从磁盘中读取映射的文件内容，用读取到的内容填充新分配的内存页，现在物理内存有了，最后一步就是在进程 1 的页表中建立共享映射的这段虚拟内存与 page cache 中缓存的文件页之间的关联。
+
+这里和私有文件映射不同的地方是，私有文件映射由于是私有的，所以在内核创建 PTE 的时候会将 PTE 设置为只读，目的是当进程写入的时候触发写保护类型的缺页中断进行写时复制 （copy on write）。共享文件映射由于是共享的，PTE 被创建出来的时候就是可写的，所以后续进程 1 在对这段虚拟内存区域写入的时候不会触发缺页中断，而是直接写入 page cache 中，整个过程没有切态，没有数据拷贝。
+
+![memory](./images/memory114.png)
+
+切换到进程 2 的视角中，虽然现在文件中被映射的这部分内容已经加载进物理内存页，并被缓存在文件的 page cache 中了。但是现在进程 2 中这段虚拟映射区在进程 2 页表中对应的 PTE 仍然是空的，当进程 2 访问这段虚拟映射区的时候依然会产生缺页中断。当进程 2 切换到内核态，处理缺页中断的时候，此时进程 2 通过 `vm_area_struct->vm_pgoff` 在 page cache 查找文件页的时候，文件页已经被进程 1 加载进 page cache 了，进程 2 一下就找到了，就不需要再去磁盘中读取映射内容了，内核会直接为进程 2 创建 PTE （由于是共享文件映射，所以这里的 PTE 也是可写的），并插入到进程 2 页表中，随后将进程 2 中的虚拟映射区通过 PTE 与 page cache 中缓存的文件页映射关联起来。
+
+![memory](./images/memory115.png)
+
+现在进程 1 和进程 2 各自虚拟内存空间中的这段虚拟内存区域 VMA，已经共同映射到了文件的 page cache 中，由于文件的 page cache 在内核中只有一份，它是和进程无关的，page cache 中的内容发生的任何变化，进程 1 和进程 2 都是可以看到的。重要的一点是，多进程对各自虚拟内存映射区 VMA 的写入操作，内核会根据自己的脏页回写策略将修改内容回写到磁盘文件中。内核提供了以下六个系统参数，来供用户配置调整内核脏页回写的行为，这些参数的配置文件存在于 `proc/sys/vm` 目录下：
+
+![memory](./images/memory116.png)
+
+- dirty_writeback_centisecs 内核参数的默认值为 500。单位为 0.01 s。也就是说内核默认会每隔 5s 唤醒一次 flusher 线程来执行相关脏页的回写。
+- drity_background_ratio ：当脏页数量在系统的可用内存 available 中占用的比例达到 drity_background_ratio 的配置值时，内核就会唤醒 flusher 线程异步回写脏页。默认值为：10。表示如果 page cache 中的脏页数量达到系统可用内存的 10% 的话，就主动唤醒 flusher 线程去回写脏页到磁盘。
+- dirty_background_bytes ：如果 page cache 中脏页占用的内存用量绝对值达到指定的 dirty_background_bytes。内核就会唤醒 flusher 线程异步回写脏页。默认为：0。
+- dirty_ratio ： dirty_background_* 相关的内核配置参数均是内核通过唤醒 flusher 线程来异步回写脏页。下面要介绍的 dirty_* 配置参数，均是由用户进程同步回写脏页。表示内存中的脏页太多了，用户进程自己都看不下去了，不用等内核 flusher 线程唤醒，用户进程自己主动去回写脏页到磁盘中。当脏页占用系统可用内存的比例达到 dirty_ratio 配置的值时，用户进程同步回写脏页。默认值为：20 。
+- dirty_bytes ：如果 page cache 中脏页占用的内存用量绝对值达到指定的 dirty_bytes。用户进程同步回写脏页。默认值为：0。
+- 内核为了避免 page cache 中的脏页在内存中长久的停留，所以会给脏页在内存中的驻留时间设置一定的期限，这个期限可由前边提到的 dirty_expire_centisecs 内核参数配置。默认为：3000。单位为：0.01 s。也就是说在默认配置下，脏页在内存中的驻留时间为 30 s。超过 30 s 之后，flusher 线程将会在下次被唤醒的时候将这些脏页回写到磁盘中。
+
+根据 mmap 共享文件映射多进程之间读写共享（不会发生写时复制）的特点，常用于多进程之间共享内存（page cache），多进程之间的通讯。
+
+#### 共享匿名映射
+
+mmap 系统调用中的 flags 参数指定为 `MAP_SHARED | MAP_ANONYMOUS`，并将 fd 参数指定为 -1 来实现共享匿名映射，这种映射方式常用于**父子进程**之间共享内存，**父子进程**之间的通讯。
+
+![memory](./images/memory117.png)
+
+共享匿名映射其他几种映射方式一样，mmap 只是负责在各个进程的虚拟内存空间中划分一段用于共享匿名映射的虚拟内存区域而已，这点笔者已经强调过很多遍了，整个映射过程并不涉及到物理内存的分配。当多个进程调用 mmap 进行共享匿名映射之后，内核只不过是为每个进程在各自的虚拟内存空间中分配了一段虚拟内存而已，由于并不涉及物理内存的分配，所以这段用于映射的虚拟内存在各个进程的页表中对应的页表项 PTE 都还是空的，如下图所示：
+
+![memory](./images/memory118.png)
+
+当任一进程，比如上图中的进程 1 开始访问这段虚拟映射区的时候，MMU 会产生缺页中断，进程 1 切换到内核态，开始处理缺页中断逻辑，在缺页中断处理程序中，内核为进程 1 分配一个物理内存页，并创建对应的 PTE 插入到进程 1 的页表中，随后用 PTE 将进程 1 的这段虚拟映射区与物理内存映射关联起来。进程 1 的缺页处理结束，从此以后，进程 1 就可以读写这段共享映射的物理内存了。
+
+![memory](./images/memory119.png)
+
+当进程 2 访问它自己的这段虚拟映射区的时候，由于进程 2 页表中对应的 PTE 为空，所以进程 2 也会发生缺页中断，随后切换到内核态处理缺页逻辑。当进程 2 开始处理缺页逻辑的时候，就会出现一个问题，因为进程 2 和进程 1 进行的是共享映射，所以进程 2 不能随便找一个物理内存页进行映射，进程 2 必须和 进程 1 映射到同一个物理内存页面，这样才能共享内存。那现在的问题是，进程 2 如何知道进程 1 已经映射了哪个物理内存页。内核在缺页中断处理中只能知道当前正在缺页的进程是谁，以及发生缺页的虚拟内存地址是什么，内核根据这些信息，根本无法知道，此时是否已经有其他进程把共享的物理内存页准备好了。这一点对于共享文件映射来说特别简单，因为有文件的 page cache 存在，进程 2 可以根据映射的文件内容在文件中的偏移 offset，从 page cache 中查找是否已经有其他进程把映射的文件内容加载到文件页中。如果文件页已经存在 page cache 中了，进程 2 直接映射这个文件页就可以了。
+
+由于共享匿名映射并没有对文件映射，所以其他进程想要在内存中查找要进行共享的内存页就非常困难了，解决的办法则是借鉴一下文件映射的方式。共享匿名映射在内核中是通过一个叫做 tmpfs 的虚拟文件系统来实现的，tmpfs 不是传统意义上的文件系统，它是基于内存实现的，挂载在 `dev/zero` 目录下。当多个进程通过 mmap 进行共享匿名映射的时候，内核会在 tmpfs 文件系统中创建一个匿名文件，这个匿名文件并不是真实存在于磁盘上的，它是内核为了共享匿名映射而模拟出来的，匿名文件也有自己的 inode 结构以及 page cache。在 mmap 进行共享匿名映射的时候，内核会把这个匿名文件关联到进程的虚拟映射区 VMA 中。这样一来，当进程虚拟映射区域与 tmpfs 文件系统中的这个匿名文件映射起来之后，后面的流程就和共享文件映射一模一样了。
+
+最后，解释下共享匿名映射为何只适用于**父子进程**之间的通讯。因为当父进程进行 mmap 共享匿名映射的时候，内核会为其创建一个匿名文件，并关联到父进程的虚拟内存空间中 `vm_area_struct->vm_file` 中。但是这时候其他进程并不知道父进程虚拟内存空间中关联的这个匿名文件，因为进程之间的虚拟内存空间都是隔离的。子进程就不一样了，在父进程调用完 mmap 之后，父进程的虚拟内存空间中已经有了一段虚拟映射区 VMA 并关联到匿名文件了。这时父进程进行 fork() 系统调用创建子进程，子进程会拷贝父进程的所有资源，当然也包括父进程的虚拟内存空间以及父进程的页表。当 fork 出子进程的时候，这时子进程的虚拟内存空间和父进程的虚拟内存空间完全是一模一样的，在子进程的虚拟内存空间中自然也有一段虚拟映射区 VMA 并且已经关联到匿名文件中了（继承自父进程）。现在父子进程的页表也是一模一样的，各自的这段虚拟映射区对应的 PTE 都是空的，一旦发生缺页，后面的流程就和共享文件映射一样了。可以把共享匿名映射看作成一种特殊的共享文件映射方式。
+
+```c
+#define MAP_LOCKED	    0x2000		/* pages are locked */
+#define MAP_POPULATE    0x008000	/* populate (prefault) pagetables */
+#define MAP_HUGETLB		0x040000	/* create a huge page mapping */
+```
+
+-  `MAP_POPULATE` 表示内核在分配完虚拟内存之后，就会马上分配物理内存，并在进程页表中建立起虚拟内存与物理内存的映射关系，这样进程在调用 mmap 之后就可以直接访问这段映射的虚拟内存地址了，不会发生缺页中断。
+- 当系统内存资源紧张的时候，内核依然会将 mmap 背后映射的这块物理内存 swap out 到磁盘中，这样进程在访问的时候仍然会发生缺页中断，为了防止这种现象，可以在调用 mmap 的时候设置 `MAP_LOCKED`。在设置了 `MAP_LOCKED` 之后，mmap 系统调用在为进程分配完虚拟内存之后，内核也会马上为其分配物理内存并在进程页表中建立虚拟内存与物理内存的映射关系，这里内核还会额外做一个动作，就是将映射的这块物理内存锁定在内存中，不允许它 swap，这样一来映射的物理内存将会一直停留在内存中，进程无论何时访问这段映射内存都不会发生缺页中断。
+- `MAP_HUGETLB` 则是用于大页内存映射的，在内核中关于物理内存的调度是按照物理内存页为单位进行的，普通物理内存页大小为 4K。但在一些对于内存敏感的使用场景中，往往期望使用一些比普通 4K 更大的页。因为这些大页要比普通的 4K 内存页要大很多，而且这些大页不允许被 swap，所以遇到缺页中断的情况就会相对减少，由于减少了缺页中断所以性能会更高。另外，由于大页比普通页要大，所以大页需要的页表项要比普通页要少，页表项里保存了虚拟内存地址与物理内存地址的映射关系，当 CPU 访问内存的时候需要频繁通过 MMU 访问页表项获取物理内存地址，由于要频繁访问，所以页表项一般会缓存在 TLB 中，因为大页需要的页表项较少，所以节约了 TLB 的空间同时降低了 TLB 缓存 MISS 的概率，从而加速了内存访问。
+
+#### 大页内存映射
+
+要想在应用程序中使用大页，需要在内核编译的时候通过设置 `CONFIG_HUGETLBFS` 和 `CONFIG_HUGETLB_PAGE` 这两个编译选项来让内核支持 HugePage。可以通过 `cat /proc/filesystems` 命令来查看当前内核中是否支持 hugetlbfs 文件系统，这是使用大页的基础。
+
+![memory](./images/memory121.png)
+
+因为大页要求的是一大片连续的物理内存，但是随着系统的长时间运行，内存页被频繁无规则的分配与回收，系统中会产生大量的内存碎片，由于内存碎片的影响，内核很难寻找到大片连续的物理内存，这样一来就很难分配到大页。所以这就要求内核在系统启动的时候预先分配好足够多的大页内存，这些大页内存被内核管理在一个大页内存池中，大页内存池中的内存全部是专用的，专门用于大页的分配，不能用于其他目的，即使系统中没有使用大页，这些大页内存就只能空闲在那里，另外这些大页内存都是被内核锁定在内存中的，即使系统内存资源紧张，**大页内存也不允许被 swap**。而且内核大页池中的这些大页内存使用完了就完了，大页池耗尽之后，应用程序将无法再使用大页。
+
+既然大页内存池在内核启动的时候就需要被预先创建好，而创建大页内存池，内核需要首先知道内存池中究竟包含多少个 HugePage，每个 HugePage 的尺寸是多少 。可以将这些参数在内核启动的时候添加到 kernel command line 中，随后内核在启动的过程中就可以根据 kernel command line 中 HugePage 相关的参数进行大页内存池的创建。下面是一些 HugePage 相关的核心 command line 参数含义：
+
+- hugepagesz ： 用于指定大页内存池中 HugePage 的 size，可以指定 hugepagesz=2M 或者 hugepagesz=1G，具体支持多少种大页尺寸由 CPU 架构决定。
+- hugepages：用于指定内核需要预先创建多少个 HugePage 在大页内存池中，可以通过指定 hugepages=256 ，来表示内核需要预先创建 256 个 HugePage 出来。除此之外 hugepages 参数还可以有 NUMA 格式，用于告诉内核需要在每个 NUMA node 上创建多少个 HugePage。可以通过设置 `hugepages=0:1,1:2 ...` 来指定 NUMA node 0 上分配 1 个 HugePage，在 NUMA node 1 上分配 2 个 HugePage
+
+- default_hugepagesz：用于指定 HugePage 默认大小。各种不同类型的 CPU 架构一般都支持多种 size 的 HugePage，比如 x86 CPU 支持 2M，1G 的 HugePage。arm64 支持 64K，2M，32M，1G 的 HugePage。这么多尺寸的 HugePage 需要通过 default_hugepagesz 来指定默认使用的 HugePage 尺寸。
+
+除此之外，还可以在系统刚刚启动之后（run time）来配置大页，因为系统刚刚启动，所以系统内存碎片化程度最小，也是一个配置大页的时机：
+
+![memory](./images/memory122.png)
+
+在 `/proc/sys/vm` 路径下有两个系统参数可以在系统 run time 的时候动态调整当前系统中 default size （由 default_hugepagesz 指定）大小的 HugePage 个数。
+
+- nr_hugepages 表示当前系统中 default size 大小的 HugePage 个数，可以通过 `echo HugePageNum > /proc/sys/vm/nr_hugepages` 命令来动态增大或者缩小 HugePage （default size ）个数。
+- nr_overcommit_hugepages 表示当系统中的应用程序申请的大页个数超过 nr_hugepages 时，内核允许在额外申请多少个大页。当大页内存池中的大页个数被耗尽时，如果此时继续有进程来申请大页，那么内核则会从当前系统中选取多个连续的普通 4K 大小的内存页，凑出若干个大页来供进程使用，这些被凑出来的大页叫做 surplus_hugepage，surplus_hugepage 的个数不能超过 nr_overcommit_hugepages。当这些 surplus_hugepage 不在被使用时，就会被释放回内核中。nr_hugepages 个数的大页则会一直停留在大页内存池中，不会被释放，也不会被 swap。
+
+以上是修改默认尺寸大小的 HugePage，另外，还可以在系统 run time 的时候动态修改指定尺寸的 HugePage，不同大页尺寸的相关配置文件存放在 `/sys/kernel/mm/hugepages` 路径下的对应目录中：
+
+![memory](./images/memory123.png)
+
+如上图所示，当前系统中所支持的大页尺寸相关的配置文件，均存放在对应 `hugepages-hugepagesize` 格式的目录中，以 2M 大页为例，进入到 `hugepages-2048kB` 目录下，发现同样也有 nr_hugepages 和 nr_overcommit_hugepages 这两个配置文件，它们的含义和上边介绍的一样，只不过这里的是具体尺寸的 HugePage 相关配置。可以通过如下命令来动态调整系统中 2M 大页的个数：
+
+```bash
+echo HugePageNum > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+```
+
+同理在 NUMA 架构的系统下，可以在 `/sys/devices/system/node/node_id` 路径下修改对应 numa node 节点中的相应尺寸 的大页个数：
+
+```bash
+echo HugePageNum > /sys/devices/system/node/node_id/hugepages/hugepages-2048kB/nr_hugepages
+```
+
+现在内核已经支持了大页，并且从内核的 boot time 或者 run time 配置好了大页内存池，可以在应用程序中来使用大页内存了，内核提供了两种方式来使用 HugePage：
+
+- 一种是本文介绍的 mmap 系统调用，需要在 flags 参数中设置 `MAP_HUGETLB`。另外内核提供了额外的两个枚举值来配合 `MAP_HUGETLB` 一起使用，它们分别是 MAP_HUGE_2MB 和 MAP_HUGE_1GB。
+  - `MAP_HUGETLB | MAP_HUGE_2MB` 用于指定需要映射的是 2M 的大页。
+  - `MAP_HUGETLB | MAP_HUGE_1GB` 用于指定需要映射的是 1G 的大页。
+  - `MAP_HUGETLB` 表示按照 default_hugepagesz 指定的默认尺寸来映射大页。
+- 另一种是 SYSV 标准的系统调用 shmget 和 shmat。
+
+```c
+addr = mmap(addr, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+```
+
+MAP_HUGETLB 只能支持 MAP_ANONYMOUS 匿名映射的方式使用 HugePage。mmap 设置了 `MAP_HUGETLB` 进行大页内存映射的时候，这个映射过程和普通的匿名映射一样，同样也是首先在进程的虚拟内存空间中划分出一段虚拟映射区 VMA 出来，同样不涉及物理内存的分配，不一样的地方是，内核在分配完虚拟内存之后，会在大页内存池中为映射的这段虚拟内存**预留**好大页内存，相当于是把即将要使用的大页内存先锁定住，不允许其他进程使用。这些被预留好的 HugePage 个数被记录在上图中的 `resv_hugepages` 文件中。当进程在访问这段虚拟内存的时候，同样会发生缺页中断，随后内核会从大页内存池中将这部分已经预留好的 resv_hugepages 分配给进程，并在进程页表中建立好虚拟内存与 HugePage 的映射。当映射的是 HugePage 时，系统调用参数中的 addr，length 需要和大页尺寸进行对齐，在本例中需要和 2M 进行对齐。
+
+如果想使用 mmap 对文件进行大页映射，就用到了前面提到的 hugetlbfs 文件系统：
+
+![memory](./images/memory124.png)
+
+hugetlbfs 是一个基于内存的文件系统，位于 hugetlbfs 文件系统下的所有文件都是被大页支持的，也就说通过 mmap 对 hugetlbfs 文件系统下的文件进行文件映射，默认都是用 HugePage 进行映射。hugetlbfs 下的文件支持大多数的文件系统操作，比如：open , close , chmod , read 等等，但是不支持 write 系统调用，如果想要对 hugetlbfs 下的文件进行写入操作，那么必须通过文件映射的方式将 hugetlbfs 中的文件通过**大页**映射进内存，然后在映射内存中进行写入操作。所以在使用 mmap 系统调用对 hugetlbfs 下的文件进行大页映射之前，首先需要做的事情就是在系统中挂载 hugetlbfs 文件系统到指定的路径下。
+
+```c
+mount -t hugetlbfs -o uid=,gid=,mode=,pagesize=,size=,min_size=,nr_inodes= none /mnt/huge
+```
+
+上面的这条命令用于将 hugetlbfs 挂载到 `/mnt/huge` 目录下，从此以后只要是在 `/mnt/huge` 目录下创建的文件，背后都是由大页支持的，也就是说如果通过 mmap 系统调用对 `/mnt/huge` 目录下的文件进行文件映射，缺页的时候，内核分配的就是内存大页。注意：只有在 hugetlbfs 下的文件进行 mmap 文件映射的时候才能使用大页，其他普通文件系统下的文件依然只能映射普通 4K 内存页。
+
+- mount 命令中的 `uid` 和 `gid` 用于指定 hugetlbfs 根目录的 owner 和 group。
+- `pagesize` 用于指定 hugetlbfs 支持的大页尺寸，默认单位是字节，可以通过设置 pagesize=2M 或者 pagesize=1G 来指定 hugetlbfs 中的大页尺寸为 2M 或者 1G。
+- `size` 用于指定 hugetlbfs 文件系统可以使用的最大内存容量是多少，单位同 pagesize 一样。
+- `min_size` 用于指定 hugetlbfs 文件系统可以使用的最小内存容量是多少。
+- `nr_inodes` 用于指定 hugetlbfs 文件系统中 inode 的最大个数，决定该文件系统中最大可以创建多少个文件。
+
+当 hugetlbfs 挂载好之后，接下来就可以直接通过 mmap 系统调用对挂载目录 `/mnt/huge` 下的文件进行内存映射了，当缺页的时候，内核会直接分配大页，大页尺寸是 `pagesize`。
+
+```c
+fd = open(“/mnt/huge/test.txt”, O_CREAT|O_RDWR);
+addr = mmap(0, MAP_LENGTH, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+```
+
+这里需要注意是，通过 mmap 映射 hugetlbfs 中的文件的时候，并不需要指定 `MAP_HUGETLB`。而通过 SYSV 标准的系统调用 shmget 和 shmat 以及前边介绍的 mmap （ flags 参数设置 MAP_HUGETLB）进行大页申请的时候，并不需要挂载 hugetlbfs。
+
+在内核中一共支持两种类型的内存大页，一种是标准大页（hugetlb pages），也就是上面内容所介绍的使用大页的方式，可以通过命令 `grep Huge /proc/meminfo` 来查看标准大页在系统中的使用情况：
+
+![memory](./images/memory125.png)
+
+标准大页相关的统计参数含义如下：
+
+- `HugePages_Total` 表示标准大页池中大页的个数。
+- `HugePages_Free` 表示大页池中还未被使用的大页个数（未被分配）。
+- `HugePages_Rsvd` 表示大页池中已经被预留出来的大页，mmap 系统调用只是为进程分配一段虚拟内存而已，并不会分配物理内存，当 mmap 进行大页映射的时候也是一样。不同之处在于，内核为进程分配完虚拟内存之后，还需要为进程在大页池中预留好本次映射所需要的大页个数，注意此时只是预留，还并未分配给进程，大页池中被预留好的大页不能被其他进程使用。这时 `HugePages_Rsvd` 的个数会相应增加，当进程发生缺页的时候，内核会直接从大页池中把这些提前预留好的大页内存映射到进程的虚拟内存空间中。这时 `HugePages_Rsvd` 的个数会相应减少。系统中真正剩余可用的个数其实是 `HugePages_Free - HugePages_Rsvd`。
+- `HugePages_Surp` 表示大页池中超额分配的大页个数，nr_overcommit_hugepages 参数表示最多能超额分配多少个大页。当大页池中的大页全部被耗尽的时候，也就是 `/proc/sys/vm/nr_hugepages` 指定的大页个数全部被分配完了，内核还可以超额为进程分配大页，超额分配出的大页个数就统计在 `HugePages_Surp` 中。
+- `Hugepagesize` 表示系统中大页的默认 size 大小，单位为 KB。
+- `Hugetlb` 表示系统中所有尺寸的大页所占用的物理内存总量。单位为 KB。
+
+内核中另外一种类型的大页是透明大页 THP (Transparent Huge Pages)，这里的透明指的是应用进程在使用 THP 的时候完全是透明的，不需要像使用标准大页那样需要系统管理员对系统进行显示的大页配置，在应用程序中也不需要向标准大页那样需要显示指定 `MAP_HUGETLB`, 或者显示映射到 hugetlbfs 里的文件中。
+
+透明大页的使用对用户完全是透明的，内核会自动做大页的映射，透明大页不需要像标准大页那样需要提前预先分配好大页内存池，透明大页的分配是动态的，由内核线程 khugepaged 负责在背后默默地将普通 4K 内存页整理成内存大页给进程使用。但是如果由于内存碎片的因素，内核无法整理出内存大页，那么就会降级为使用普通 4K 内存页。但是透明大页这里会有一个问题，当碎片化严重的时候，内核会启动 kcompactd 线程去整理碎片，期望获得连续的内存用于大页分配，但是 compact 的过程可能会引起 sys cpu 飙高，应用程序卡顿。透明大页是允许 swap 的，这一点和标准大页不同，在内存紧张需要 swap 的时候，透明大页会被内核默默拆分成普通 4K 内存页，然后 swap out 到磁盘。透明大页只支持 2M 的大页，标准大页可以支持 1G 的大页，透明大页主要应用于匿名内存中，可以在 tmpfs 文件系统中使用。
+
+可以通过修改 `/sys/kernel/mm/transparent_hugepage/enabled` 配置文件来选择开启或者禁用透明大页：
+
+![memory](./images/memory126.png)
+
+- always 表示系统全局开启透明大页 THP 功能。这意味着每个进程都会去尝试使用透明大页。
+- never 表示系统全局关闭透明大页 THP 功能。进程将永远不会使用透明大页。
+- madvise 表示进程如果想要使用透明大页，需要通过 madvise 系统调用并设置参数 advice 为 `MADV_HUGEPAGE` 来建议内核，在 addr 到 addr + length 这片虚拟内存区域中，需要使用透明大页来映射。
+
+```c
+#include <sys/mman.h>
+
+int madvise(void addr, size_t length, int advice);
+```
+
+一般会首先使用 mmap 先映射一段虚拟内存区域，然后通过 madvise 建议内核，将来在缺页的时候，需要为这段虚拟内存映射透明大页。由于背后需要通过内核线程 khugepaged 来不断的扫描整理系统中的普通 4K 内存页，然后将他们拼接成一个大页来给进程使用，其中涉及内存整理和回收等耗时的操作，且这些操作会在内存路径中加锁，而 khugepaged 内核线程可能会在错误的时间启动扫描和转换大页的操作，造成随机不可控的性能下降。
+
+另外一点，透明大页不像标准大页那样是提前预分配好的，透明大页是在系统运行时动态分配的，在内存紧张的时候，透明大页和普通 4K 内存页的分配过程一样，有可能会遇到直接内存回收（direct reclaim)以及直接内存整理（direct compaction），这些操作都是同步的并且非常耗时，会对性能造成非常大的影响。
+
+ `cat /proc/meminfo` 命令中显示的 AnonHugePages 就表示透明大页在系统中的使用情况。另外可以通过 `cat /proc/pid/smaps | grep AnonHugePages` 命令来查看某个进程对透明大页的使用情况。
+
+#### mmap代码分析
+
+![memory](./images/memory127.png)
+
+```c
+SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
+		unsigned long, prot, unsigned long, flags,
+		unsigned long, fd, unsigned long, off)
+{
+	if (offset_in_page(off) != 0)
+		return -EINVAL;
+
+	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
+}
+
+unsigned long ksys_mmap_pgoff(unsigned long addr, unsigned long len,
+                  unsigned long prot, unsigned long flags,
+                  unsigned long fd, unsigned long pgoff)
+{
+    struct file *file = NULL;
+    unsigned long retval;
+
+    // 预处理文件映射
+    if (!(flags & MAP_ANONYMOUS)) {
+        // 根据 fd 获取映射文件的 struct file 结构
+        audit_mmap_fd(fd, flags);
+        file = fget(fd);
+        if (!file)
+            // 这里可以看出如果是匿名映射的话必须要指定 MAP_ANONYMOUS 否则这里找不到对应的文件就返回错误了
+            return -EBADF;
+        // 映射文件是否是 hugetlbfs 中的文件，hugetlbfs 中的文件默认由大页支持
+        if (is_file_hugepages(file)) {
+            // mmap 进行文件大页映射，len 需要和大页尺寸对齐
+            len = ALIGN(len, huge_page_size(hstate_file(file)));
+        /* 这里可以看出如果想要使用 mmap 对文件进行大页映射，那么映射的文件必须是 hugetlbfs 中的,
+         * 这种映射方式必须提前手动挂载 hugetlbfs 文件系统到指定路径下。
+         * mmap 文件大页映射并不需要指定 MAP_HUGETLB，并且 mmap 不能对普通文件进行大页映射
+         */
+        } else if (flags & MAP_HUGETLB) {
+        	retval = -EINVAL;
+            goto out_fput;
+        }
+    } else if (flags & MAP_HUGETLB) {
+        // 这里可以看出 MAP_HUGETLB 只能支持 MAP_ANONYMOUS 匿名映射的方式使用 HugePage
+        struct user_struct *user = NULL;
+        // 内核中的大页池（预先创建）
+        struct hstate *hs;
+        // 选取指定大页尺寸的大页池（内核中存在不同尺寸的大页池）
+        hs = hstate_sizelog((flags >> MAP_HUGE_SHIFT) & MAP_HUGE_MASK);
+        if (!hs)
+            return -EINVAL;
+        // 映射长度 len 必须与大页尺寸对齐
+        len = ALIGN(len, huge_page_size(hs));
+ 
+        // 在 hugetlbfs 中创建 anon_hugepage 文件，并预留大页内存（禁止其他进程申请）
+        file = hugetlb_file_setup(HUGETLB_ANON_FILE, len,
+                VM_NORESERVE,
+                &user, HUGETLB_ANONHUGE_INODE,
+                (flags >> MAP_HUGE_SHIFT) & MAP_HUGE_MASK);
+        if (IS_ERR(file))
+            return PTR_ERR(file);
+    }
+
+    flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
+    // 开始内存映射
+    retval = vm_mmap_pgoff(file, addr, len, prot, flags, pgoff);
+out_fput:
+    if (file)
+        // file 引用计数减 1
+        fput(file);
+    return retval;
+}
+
+static inline bool is_file_hugepages(struct file *file)
+{
+    // hugetlbfs 文件系统中的文件默认由大页支持，mmap 通过映射 hugetlbfs 中的文件实现文件大页映射
+    if (file->f_op == &hugetlbfs_file_operations)
+        return true;
+
+    // 通过 shmat 使用匿名大页
+    return is_file_shm_hugepages(file);
+}
+
+bool is_file_shm_hugepages(struct file *file)
+{
+    // SYSV 标准的系统调用 shmget 和 shmat 通过 shm 文件系统来共享内存，通过 shmat 的方式使用大页会设置
+    return file->f_op == &shm_file_operations_huge;
+}
+
+unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
+    unsigned long len, unsigned long prot,
+    unsigned long flag, unsigned long pgoff)
+{
+    unsigned long ret;
+    // 获取进程虚拟内存空间
+    struct mm_struct *mm = current->mm;
+    /* 是否需要为映射的 VMA，提前分配物理内存页，避免后续的缺页
+     * 取决于 flag 是否设置了 MAP_POPULATE 或者 MAP_LOCKED，这里的 populate 表示需要分配物理内存的大小
+     */
+    unsigned long populate;
+
+    ret = security_mmap_file(file, prot, flag);
+    if (!ret) {
+        // 对进程虚拟内存空间加写锁保护，防止多线程并发修改
+        if (mmap_write_lock_killable(&mm->mmap_sem))
+            return -EINTR;
+        // 开始 mmap 内存映射，在进程虚拟内存空间中分配一段 vma，并建立相关映射关系，ret 为映射虚拟内存区域的起始地址
+        ret = do_mmap(file, addr, len, prot, flag, pgoff,
+                    &populate, &uf);
+        mmap_write_unlock(&mm->mmap_sem);
+        if (populate)
+            // 提前分配物理内存页面，后续访问不会缺页，为 [ret , ret + populate] 这段虚拟内存立即分配物理内存
+            mm_populate(ret, populate);
+    }
+    return ret;
+}
+
+int __mm_populate(unsigned long start, unsigned long len, int ignore_errors)
+{
+    struct mm_struct *mm = current->mm;
+    unsigned long end, nstart, nend;
+    struct vm_area_struct *vma = NULL;
+    long ret = 0;
+
+    end = start + len;
+
+    // 依次遍历进程地址空间中 [start , end] 这段虚拟内存范围的所有 vma
+    for (nstart = start; nstart < end; nstart = nend) {
+
+        //省略查找指定地址范围内 vma 的过程
+
+        // 为这段地址范围内的所有 vma 分配物理内存
+        ret = populate_vma_page_range(vma, nstart, nend, &locked);
+        // 继续为下一个 vma （如果有的话）分配物理内存
+        nend = nstart + ret * PAGE_SIZE;
+        ret = 0;
+    }
+
+    return ret; /* 0 or negative error code */
+}
+
+long populate_vma_page_range(struct vm_area_struct *vma,
+        unsigned long start, unsigned long end, int *nonblocking)
+{
+    struct mm_struct *mm = vma->vm_mm;
+    // 计算 vma 中包含的虚拟内存页个数，后续会按照 nr_pages 分配物理内存
+    unsigned long nr_pages = (end - start) / PAGE_SIZE;
+    int gup_flags;
+
+    // 循环遍历 vma 中的每一个虚拟内存页，依次为其分配物理内存页
+    return __get_user_pages(current, mm, start, nr_pages, gup_flags,
+                NULL, NULL, nonblocking);
+}
+
+static long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
+        unsigned long start, unsigned long nr_pages,
+        unsigned int gup_flags, struct page **pages,
+        struct vm_area_struct **vmas, int *nonblocking)
+{
+    long ret = 0, i = 0;
+    struct vm_area_struct *vma = NULL;
+    struct follow_page_context ctx = { NULL };
+
+    if (!nr_pages)
+        return 0;
+
+    start = untagged_addr(start);
+    // 循环遍历 vma 中的每一个虚拟内存页
+    do {
+        struct page *page;
+        unsigned int foll_flags = gup_flags;
+        unsigned int page_increm;
+        // 在进程页表中检查该虚拟内存页背后是否有物理内存页映射
+        page = follow_page_mask(vma, start, foll_flags, &ctx);
+        if (!page) {
+            /* 如果虚拟内存页在页表中并没有物理内存页映射，那么这里调用 faultin_page
+             * 底层会调用到 handle_mm_fault 进入缺页处理流程，分配物理内存，在页表中建立好映射关系
+             */
+            ret = faultin_page(tsk, vma, start, &foll_flags,
+                    nonblocking);
+
+    } while (nr_pages);
+
+    return i ? i : ret;
+}
+    
+unsigned long do_mmap(struct file *file, unsigned long addr,
+            unsigned long len, unsigned long prot,
+            unsigned long flags, vm_flags_t vm_flags,
+            unsigned long pgoff, unsigned long *populate,
+            struct list_head *uf)
+{
+    struct mm_struct *mm = current->mm;
+
+    // 省略参数校验
+        
+    /* 一个进程虚拟内存空间内所能包含的虚拟内存区域 vma 是有数量限制的
+     * sysctl_max_map_count 规定了进程虚拟内存空间所能包含 VMA 的最大个数
+     * 可以通过 /proc/sys/vm/max_map_count 内核参数调整 sysctl_max_map_count
+     * mmap 需要再进程虚拟内存空间中创建映射的 VMA，这里需要检查 VMA 的个数是否超过最大限制
+     */
+    if (mm->map_count > sysctl_max_map_count)
+        return -ENOMEM;
+
+    /* 在进程地址空间中寻找出一段长度为 len，并且还未映射的虚拟内存区域 vma 出来。
+     * 返回值 addr 表示这段虚拟内存区域的起始地址，后续将会用于 mmap 内存映射
+     */
+    addr = get_unmapped_area(file, addr, len, pgoff, flags);
+
+    /* 通过 calc_vm_prot_bits 和 calc_vm_flag_bits 分别将 mmap 参数 prot , flag 中   
+     * 设置的访问权限以及映射方式等枚举值转换为统一的 vm_flags，后续一起映射进 VMA 的相应属性中，相应前缀转换为 VM_
+     */
+    vm_flags |= calc_vm_prot_bits(prot, pkey) | calc_vm_flag_bits(flags) |
+            mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
+
+    // 设置了 MAP_LOCKED，表示用户期望 mmap 背后映射的物理内存锁定在内存中，不允许 swap
+    if (flags & MAP_LOCKED)
+        // 这里需要检查是否可以将本次映射的物理内存锁定
+        if (!can_do_mlock())
+            return -EPERM;
+    // 进一步检查锁定的内存页数是否超过了内核限制
+    if (mlock_future_check(mm, vm_flags, len))
+        return -EAGAIN;
+
+    // 省略设置其他 vm_flags 相关细节      
+
+    /* 通常内核会为 mmap 申请虚拟内存的时候会综合考虑 ram 以及 swap space 的总体大小。
+     * 当映射的虚拟内存过大，而没有足够的 swap space 的时候， mmap 就会失败。
+     * 设置 MAP_NORESERVE，内核将不会考虑上面的限制因素
+     * 这样当通过 mmap 申请大量的虚拟内存，并且当前系统没有足够的 swap space 的时候，mmap 系统调用依然能够成功
+     */
+    if (flags & MAP_NORESERVE) {
+        /* 设置 MAP_NORESERVE 的目的是为了应用可以申请过量的虚拟内存
+         * 如果内核本身是禁止 overcommit 的，那么设置 MAP_NORESERVE 是无意义的
+         * 如果内核允许过量申请虚拟内存时（overcommit 为 0 或者 1）
+         * 无论映射多大的虚拟内存，mmap 将会始终成功，但缺页的时候会容易导致 oom
+         * 可以通过内核参数 /proc/sys/vm/overcommit_memory 来调整
+         */
+        if (sysctl_overcommit_memory != OVERCOMMIT_NEVER)
+            // 设置 VM_NORESERVE 表示无论申请多大的虚拟内存，内核总会答应
+            vm_flags |= VM_NORESERVE;
+
+        // 大页内存是提前预留出来的，并且本身就不会被 swap，所以不需要像普通内存页那样考虑 swap space 的限制因素
+        if (file && is_file_hugepages(file))
+            vm_flags |= VM_NORESERVE;
+    }
+    // 这里就是 mmap 内存映射的核心
+    addr = mmap_region(file, addr, len, vm_flags, pgoff, uf);
+
+    /* 当 mmap 设置了 MAP_POPULATE 或者 MAP_LOCKED 标志
+     * 那么在映射完之后，需要立马为这块虚拟内存分配物理内存页，后续访问就不会发生缺页了
+     */
+    if (!IS_ERR_VALUE(addr) &&
+        ((vm_flags & VM_LOCKED) ||
+         (flags & (MAP_POPULATE | MAP_NONBLOCK)) == MAP_POPULATE))
+        // 设置需要分配的物理内存大小
+        *populate = len;
+    return addr;
+}
+
+/* 内核的默认 overcommit 策略。在这种模式下，过量的虚拟内存申请将会被拒绝，
+ * 内核会对虚拟内存能够过量申请多少做出一定的限制，这种策略既不激进也不保守，比较中庸。
+ */
+#define OVERCOMMIT_GUESS		0
+/* 最为激进的 overcommit 策略，无论进程申请多大的虚拟内存，只要不超过整个进程虚拟内存空间的大小，内核总会痛快的答应。
+ * 但是这种策略下，虚拟内存的申请虽然容易了，但是当进程遇到缺页，内核为其分配物理内存的时候，会非常容易造成 OOM 。
+ */
+#define OVERCOMMIT_ALWAYS		1
+// 最为严格的一种控制虚拟内存 overcommit 的策略，在这种模式下，内核会严格的规定虚拟内存的申请用量。
+#define OVERCOMMIT_NEVER		2
+    
+bool can_do_mlock(void)
+{
+    /* 内核会限制能够被锁定的内存资源大小，单位为bytes
+     * 这里获取 RLIMIT_MEMLOCK 能够锁定的内存资源，如果为 0 ，则不能够锁定内存了。
+     * 可以通过修改 /etc/security/limits.conf 文件中的 memlock 相关配置项
+     * 来调整能够被锁定的内存资源配额，设置为 unlimited 表示不对锁定内存进行限制
+     */
+    if (rlimit(RLIMIT_MEMLOCK) != 0)
+        return true;
+    // 检查内核是否允许 mlock ，mlockall 等内存锁定操作
+    if (capable(CAP_IPC_LOCK))
+        return true;
+    return false;
+}
+    
+struct task_struct {
+  struct signal_struct	*signal;
+}
+
+struct signal_struct {
+  /* 进程相关的资源限制，相关的资源限制以数组的形式组织在 rlim 中
+   * RLIMIT_MEMLOCK 下标对应的是进程能够锁定的内存资源，单位为bytes
+   */
+  struct rlimit rlim[RLIM_NLIMITS];
+}
+
+struct rlimit {
+	__kernel_ulong_t	rlim_cur;
+	__kernel_ulong_t	rlim_max;
+};
+    
+// 定义在文件：/include/linux/sched/signal.h
+static inline unsigned long rlimit(unsigned int limit)
+{
+    // 参数 limit 为相关资源的下标
+    return task_rlimit(current, limit);
+}
+
+static inline unsigned long task_rlimit(const struct task_struct *task,
+        unsigned int limit)
+{
+    return READ_ONCE(task->signal->rlim[limit].rlim_cur);
+}
+    
+static inline int mlock_future_check(struct mm_struct *mm,
+                     unsigned long flags,
+                     unsigned long len)
+{
+    unsigned long locked, lock_limit;
+
+    if (flags & VM_LOCKED) {
+        // 需要锁定的内存页数
+        locked = len >> PAGE_SHIFT;
+        // 更新进程内存空间中已经锁定的内存页数
+        locked += mm->locked_vm;
+        // 获取内核还能允许锁定的内存页数
+        lock_limit = rlimit(RLIMIT_MEMLOCK);        
+        lock_limit >>= PAGE_SHIFT;
+        // 如果超出允许锁定的内存限额，那么就返回错误
+        if (locked > lock_limit && !capable(CAP_IPC_LOCK))
+            return -EAGAIN;
+    }
+    return 0;
+}
+```
+
+##### 虚拟内存分配流程
+
+###### 文件映射与匿名映射区的布局
+
+文件映射与匿名映射区的布局在 linux 内核中分为两种：一种是经典布局，另一种是新式布局，不同的体系结构可以通过内核参数 `/proc/sys/vm/legacy_va_layout` 来指定具体采用哪种布局。 1 表示采用经典布局， 0 表示采用新式布局。
+
+![memory](./images/memory128.png)
+
+在经典布局下，文件映射与匿名映射区的地址增长方向是从低地址到高地址，也就是说映射区是从下往上增长，这也就导致了 mmap 在分配虚拟内存的时候需要从下往上搜索空闲 vma。
+
+![memory](./images/memory129.png)
+
+经典布局下，文件映射与匿名映射区的起始地址 `mm_struct->mmap_base` 被设置在 `task_size` 的三分之一处，`task_size` 为进程虚拟内存空间与内核空间的分界线，也就说 `task_size` 是进程虚拟内存空间的末尾，大小为 3G。这表明了文件映射与匿名映射区起始于进程虚拟内存空间开始的 1G 位置处，而映射区恰好位于整个进程虚拟内存空间的中间，其下方就是堆了，由于代码段，数据段的存在，可供堆进行扩展的空间是小于 1G 的，否则就会与映射区冲突了。这种布局对于虚拟内存空间非常大的体系结构，比如 AMD64 , 是合适的而且会工作的非常好，因为虚拟内存空间足够的大（128T），堆与映射区都有足够的空间来扩展，不会发生冲突。但是对于虚拟内存空间比较小的体系结构，比如 IA-32，只能提供 3G 大小的进程虚拟内存空间，就会出现上述冲突问题，于是内核在 2.6.7 版本引入了新式布局。在新式布局下，文件映射与匿名映射区的地址增长方向是从高地址到低地址，也就是说映射区是从上往下增长，这也就导致了 mmap 在分配虚拟内存的时候需要从上往下搜索空闲 vma。
+
+![memory](./images/memory130.png)
+
+在新式布局中，栈的空间大小会被限制，栈最大空间大小保存在 `task_struct->signal_struct->rlimp[RLIMIT_STACK]` 中，可以通过修改 `/etc/security/limits.conf` 文件中 stack 配置项来调整栈最大空间的限制。由于栈变为有界的了，所以文件映射与匿名映射区可以在栈的下方立即开始，为确保栈与映射区不会冲突，它们中间还设置了 1M 大小的安全间隙 `stack_guard_gap`。这样一来堆在进程地址空间中较低的地址处开始向上增长，而映射区位于进程空间较高的地址处向下增长，因此堆区和映射区在新式布局下都可以较好的扩展，直到耗尽剩余的虚拟内存区域。
+
+进程虚拟内存空间的创建以及初始化是由 `load_elf_binary` 函数负责的，当进程通过 fork() 系统调用创建出子进程之后，子进程可以通过前面介绍的 execve 系统调用加载并执行一个指定的二进制执行文件。execve 函数会调用到 `load_elf_binary`，由 `load_elf_binary` 负责解析指定的 ELF 格式的二进制可执行文件，并将二进制文件中的 .text , .data 映射到新进程的虚拟内存空间中的代码段，数据段，BSS 段中。随后会通过 `setup_new_exec` 创建文件映射与匿名映射区，设置映射区的起始地址 `mm_struct->mmap_base`，通过 `setup_arg_pages` 创建栈，设置 `mm->start_stack` 栈的起始地址（栈底）。这样新进程的虚拟内存空间就被创建了出来。
+
+```c
+static int load_elf_binary(struct linux_binprm *bprm)
+{
+    // 创建文件映射与匿名映射区，设置映射区的起始地址 mm_struct->mmap_base
+    setup_new_exec(bprm);
+    // 创建栈，设置  mm->start_stack 栈的起始地址（栈底）
+    retval = setup_arg_pages(bprm, randomize_stack_top(STACK_TOP),
+                 executable_stack);
+}
+
+void setup_new_exec(struct linux_binprm * bprm)
+{
+    // 对文件映射与匿名映射区进行布局
+    arch_pick_mmap_layout(current->mm, &bprm->rlim_stack);
+}
+
+void arch_pick_mmap_layout(struct mm_struct *mm, struct rlimit *rlim_stack)
+{
+	unsigned long random_factor = 0UL;
+
+	if (current->flags & PF_RANDOMIZE)
+		random_factor = arch_mmap_rnd();
+
+	if (mmap_is_legacy(rlim_stack)) {
+        // 经典布局下，映射区分配虚拟内存方法
+		mm->mmap_base = TASK_UNMAPPED_BASE + random_factor;
+		mm->get_unmapped_area = arch_get_unmapped_area;
+	} else {
+        // 新式布局下，映射区分配虚拟内存方法
+		mm->mmap_base = mmap_base(random_factor, rlim_stack);
+		mm->get_unmapped_area = arch_get_unmapped_area_topdown;
+	}
+}
+
+/* 经典布局（返回 1）新式布局（返回 0）
+ * 用户可通过设置 /proc/sys/vm/legacy_va_layout 内核参数来指定 sysctl_legacy_va_layout 变量的值。
+ */	
+static int mmap_is_legacy(void)
+{
+    // ADDR_COMPAT_LAYOUT 标志则表示进程虚拟内存空间布局应该采用经典布局
+    if (current->personality & ADDR_COMPAT_LAYOUT)
+        return 1;
+
+    // 栈大小无限也表示采用经典布局
+    if (rlim_stack->rlim_cur == RLIM_INFINITY)
+		return 1;
+
+    return sysctl_legacy_va_layout;
+}
+```
+
+由于在经典布局下，文件映射与匿名映射区的地址增长方向是从低地址到高地址增长，在新布局下，文件映射与匿名映射区的地址增长方向是从高地址到低地址增长。所以当 mmap 在文件映射与匿名映射区中寻找空闲 vma 的时候，会受到不同布局的影响，其寻找方向是相反的，因此不同的体系结构需要设置 `HAVE_ARCH_UNMAPPED_AREA` 预处理符号，并提供 `arch_get_unmapped_area` /  `arch_get_unmapped_area_topdown` 函数的实现。如果文件映射与匿名映射区采用的是经典布局，那么 mmap 就会通过 `arch_get_unmapped_area` 来在映射区查找空闲的 vma。如果文件映射与匿名映射区采用的是新布局，mmap 在则会通过 `arch_get_unmapped_area_topdown` 函数在文件映射与匿名映射区寻找空闲 vma。无论是经典布局下的 `arch_get_unmapped_area`，还是新布局下的 `arch_get_unmapped_area_topdown` 都会设置到 `mm_struct->get_unmapped_area` 这个函数指针中，后续 mmap 会利用这个 `get_unmapped_area` 来在文件映射与匿名映射区中划分虚拟内存区域 vma。
+
+```c
+struct mm_struct {
+        // 文件映射与匿名映射区的起始地址，无论在经典布局下还是在新布局下，起始地址最终都会设置在这里
+        unsigned long mmap_base;    /* base of mmap area */
+        // 文件映射与匿名映射区在经典布局下的起始地址
+        unsigned long mmap_legacy_base; /* base of mmap area in bottom-up allocations */
+        // 进程虚拟内存空间与内核空间的分界线（也是用户空间的结束地址）
+        unsigned long task_size;    /* size of task vm space */
+        // 用户空间中，栈顶位置
+        unsigned long start_stack;
+}
+```
+
+![memory](./images/memory131.png)
+
+如果开启了进程虚拟内存空间的随机化，全局变量 `randomize_va_space` 就会为 1，进程的 flags 标志将会设置为 `PF_RANDOMIZE`，表示对进程地址空间进行随机化布局。可以通过调整内核参数 `/proc/sys/kernel/randomize_va_space` 的值来开启或者关闭进程虚拟内存空间布局随机化特性。在开启进程地址空间随机化布局之后，进程虚拟内存空间中的文件映射与匿名映射区起始地址会加上一个随机偏移 rnd。事实上，不仅仅文件映射与匿名映射区起始地址会加随机偏移 rnd，虚拟内存空间中的栈顶位置 `STACK_TOP`，堆的起始位置 `start_brk`，BSS 段的起始位置 `elf_bss`，数据段的起始位置 `start_data`，代码段的起始位置 `start_code`，都会加上一个随机偏移。
+
+![memory](./images/memory132.png)
+
+```c
+static int load_elf_binary(struct linux_binprm *bprm)
+{
+    // 是否开启进程地址空间的随机化布局
+    if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)
+        current->flags |= PF_RANDOMIZE;
+    // 创建文件映射与匿名映射区，设置映射区的起始地址 mm_struct->mmap_base
+    setup_new_exec(bprm);
+    // 创建栈，设置  mm->start_stack 栈的起始地址（栈底）
+    retval = setup_arg_pages(bprm, randomize_stack_top(STACK_TOP),
+                 executable_stack);
+}
+
+// 获取地址随机化偏移量
+unsigned long arch_mmap_rnd(void)
+{
+	unsigned long rnd;
+
+#ifdef CONFIG_HAVE_ARCH_MMAP_RND_COMPAT_BITS
+	if (is_compat_task())
+		rnd = get_random_long() & ((1UL << mmap_rnd_compat_bits) - 1);
+	else
+#endif /* CONFIG_HAVE_ARCH_MMAP_RND_COMPAT_BITS */
+		rnd = get_random_long() & ((1UL << mmap_rnd_bits) - 1);
+
+	return rnd << PAGE_SHIFT;
+}
+```
+
+![memory](./images/memory133.png)
+
+进程虚拟内存空间中栈顶 `STACK_TOP` 的位置一般设置为 `task_size`，也就是说从进程地址空间的末尾开始向下增长，如果开启地址随机化特性，`STACK_TOP` 还需要再加上一个随机偏移 `stack_maxrandom_size`。整个栈空间的最大长度设置在 `rlim_stack->rlim_cur` 中，在栈区和映射区之间，有一个 1M 大小的间隙 `stack_guard_gap`。映射区的起始地址 `mmap_base` 与进程地址空间末尾 `task_size` 的间隔为 gap 大小，`gap = rlim_stack->rlim_cur + stack_guard_gap`。gap 的最小值为 128M，最大值为 (`task_size` / 6) * 5。`task_size` 减去 gap 就是映射区起始地址 `mmap_base` 的位置，如果启用地址随机化特性，还需要在此基础上减去一个随机偏移 rnd。
+
+```c
+// 栈区与映射区之间的间隔 1M
+unsigned long stack_guard_gap = 256UL<<PAGE_SHIFT;
+
+static unsigned long mmap_base(unsigned long rnd, unsigned long task_size,
+                   struct rlimit *rlim_stack)
+{
+    // 栈空间大小
+    unsigned long gap = rlim_stack->rlim_cur;
+    // 栈区与映射区之间的间隔为 1M 大小
+    unsigned long pad = stack_guard_gap;
+    unsigned long gap_min, gap_max;
+
+    // gap 在这里的语义是映射区的起始地址 mmap_base 距离进程地址空间的末尾 task_size 的距离，此处为放溢出校验
+    if (gap + pad > gap)
+        gap += pad;
+
+	// #define MIN_GAP (SZ_128M)
+    if (gap < MIN_GAP)
+        gap = MIN_GAP;
+    // #define MAX_GAP (STACK_TOP / 6 * 5)
+    else if (gap > MAX_GAP)
+        gap = MAX_GAP;
+    // 映射区在新式布局下的起始地址 mmap_base，如果开启随机化，则需要在减去一个随机偏移 rnd
+    return PAGE_ALIGN(STACK_TOP - gap - rnd);
+}
+```
+
+`get_unmapped_area` 主要的目的就是在具体的映射区布局下，根据布局特点，真正负责划分虚拟内存区域的函数。在经典布局下，`mm->get_unmapped_area` 指向的函数为 `arch_get_unmapped_area`。如果 mmap 进行的是私有匿名映射，那么内核会通过 `mm->get_unmapped_area` 函数进行虚拟内存的分配。如果 mmap 进行的是文件映射，那么内核则采用的是特定于文件系统的 `file->f_op->get_unmapped_area` 函数。比如，通过 mmap 映射的是 ext4 文件系统下的文件，那么 `file->f_op->get_unmapped_area` 指向的是 `thp_get_unmapped_area` 函数，专门为 ext4 文件映射申请虚拟内存。
+
+```c
+const struct file_operations ext4_file_operations = {
+        .mmap           = ext4_file_mmap
+        .get_unmapped_area = thp_get_unmapped_area,
+};
+```
+
+如果 mmap 进行的是共享匿名映射，由于共享匿名映射的本质其实是基于 tmpfs 的虚拟文件系统中的匿名文件进行的共享文件映射，所以这种情况下 `get_unmapped_area` 函数是需要基于 tmpfs 的虚拟文件系统的，在共享匿名映射的情况下 `get_unmapped_area` 指向 `shmem_get_unmapped_area` 函数。
+
+```c
+unsigned long
+get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
+        unsigned long pgoff, unsigned long flags)
+{
+    /* 在进程虚拟空间中寻找还未被映射的 VMA 这段核心逻辑是被内核实现在特定于体系结构的函数中
+     * 该函数指针用于指向真正的 get_unmapped_area 函数，在经典布局下，真正的实现函数为 arch_get_unmapped_area
+     */
+    unsigned long (*get_area)(struct file *, unsigned long,
+                  unsigned long, unsigned long, unsigned long);
+
+    // 映射的虚拟内存区域长度不能超过进程的地址空间
+    if (len > TASK_SIZE)
+        return -ENOMEM;
+    // 如果是匿名映射，则采用 mm_struct 中保存的特定于体系结构的 arch_get_unmapped_area 函数
+    get_area = current->mm->get_unmapped_area;
+    if (file) {
+        /* 如果是文件映射话，则需要使用 file->f_op 中的 get_unmapped_area，来为文件映射申请虚拟内存
+         * file->f_op 保存的是特定于文件系统中文件的相关操作
+         */
+        if (file->f_op->get_unmapped_area)
+            get_area = file->f_op->get_unmapped_area;
+    } else if (flags & MAP_SHARED) {
+        // 共享匿名映射是通过在 tmpfs 中创建的匿名文件实现的，所以这里也有其专有的 get_unmapped_area 函数
+        pgoff = 0;
+        get_area = shmem_get_unmapped_area;
+    }
+    
+    // 在进程虚拟内存空间中，根据指定的 addr，len 查找合适的VMA
+    addr = get_area(file, addr, len, pgoff, flags);
+    if (IS_ERR_VALUE(addr))
+        return addr;
+    // VMA 区域不能超过进程地址空间
+    if (addr > TASK_SIZE - len)
+        return -ENOMEM;
+    // addr 需要与 page size 对齐
+    if (offset_in_page(addr))
+        return -EINVAL;
+
+    return error ? error : addr;
+}
+```
+
+![memory](./images/memory134.png)
+
+```c
+unsigned long __thp_get_unmapped_area(struct file *filp, unsigned long len,
+                loff_t off, unsigned long flags, unsigned long size)
+{
+    ret = current->mm->get_unmapped_area(filp, 0, len_pad,
+                                         off >> PAGE_SHIFT, flags);
+    return ret;
+}
+
+unsigned long shmem_get_unmapped_area(struct file *file,
+                      unsigned long uaddr, unsigned long len,
+                      unsigned long pgoff, unsigned long flags)
+{
+    unsigned long (*get_area)(struct file *,
+        unsigned long, unsigned long, unsigned long, uns
+
+    get_area = current->mm->get_unmapped_area;
+    addr = get_area(file, uaddr, len, pgoff, flags);
+    
+    return addr;
+}
+```
+
+![memory](./images/memory135.png)
+
+如果在 flags 参数中指定了 `MAP_FIXED` 标志，则意味着用户强制要求内核在指定的起始地址 addr 处开始映射 len 长度的虚拟内存区域，无论这段虚拟内存区域 [addr , addr + len] 是否已经存在映射关系，内核都会强行进行映射，如果这块区域已经存在映射关系，那么后续内核会把旧的映射关系覆盖掉。
+
+![memory](./images/memory136.png)
+
+如果指定了 addr，但是并没有指定 `MAP_FIXED`，则意味着用户只是建议内核优先考虑从指定的 addr 地址处开始映射，但是如果 `[addr , addr+len]` 这段虚拟内存区域已经存在映射关系，内核则不会按照指定的 addr 开始映射，而是会自动查找一段空闲的 len 长度的虚拟内存区域。这一部分的工作由 `vm_unmapped_area` 函数承担。如果通过查找发现， `[addr , addr+len]` 这段虚拟内存地址范围并未存在任何映射关系，那么 addr 就会作为 mmap 映射的起始地址。这里面会分为两种情况：
+
+1. 第一种是指定的 addr 比较大，addr 位于文件映射与匿名映射区中所有映射区域 vma 的最后面，这样一来，`[addr , addr + len]` 这段地址范围当然是空闲的了。
+2. 第二种情况是指定的 addr 恰好位于一个 vma 和另一个 vma 中间的地址间隙中，并且这个地址间隙刚好大于或者等于指定的映射长度 len。内核就可以将这个地址间隙映射起来。
+
+![memory](./images/memory137.png)
+
+```c
+// 内核标准实现 
+unsigned long
+arch_get_unmapped_area(struct file *filp, unsigned long addr,
+        unsigned long len, unsigned long pgoff, unsigned long flags)
+{
+    struct mm_struct *mm = current->mm;
+    struct vm_area_struct *vma, *prev;
+    struct vm_unmapped_area_info info;
+    // 进程虚拟内存空间的末尾 TASK_SIZE
+    const unsigned long mmap_end = arch_get_mmap_end(addr);
+    // 映射区域长度是否超过进程虚拟内存空间
+    if (len > mmap_end - mmap_min_addr)
+        return -ENOMEM;
+    /* 如果指定了 MAP_FIXED 表示必须要从指定的 addr 开始映射 len 长度的区域，
+     * 如果这块区域已经存在映射关系，那么后续内核会把旧的映射关系覆盖掉
+     */
+    if (flags & MAP_FIXED)
+        return addr;
+
+    /* 没有指定 MAP_FIXED，但是指定了 addr
+     * 表示希望内核从指定的 addr 地址开始映射，内核这里会检查指定的这块虚拟内存范围是否有效
+     */
+    if (addr) {
+        // addr 先保证与 page size 对齐
+        addr = PAGE_ALIGN(addr);
+        /* 内核这里需要确认一下指定的 [addr, addr + len] 这段虚拟内存区域是否存在已有的映射关系
+         * [addr, addr+len] 地址范围内已经存在映射关系，则不能按照指定的 addr 作为映射起始地址
+         * 在进程地址空间中查找第一个符合 addr < vma->vm_end  条件的 VMA
+         * 如果不存在这样一个 vma（!vma）, 则表示 [addr, addr + len] 这段范围的虚拟内存是可以使用的，
+         * 内核将会从指定的 addr 开始映射
+         * 如果存在这样一个 vma ，则表示  [addr, addr + len] 这段范围的虚拟内存区域目前已经存在映射关系了，
+         * 不能采用 addr 作为映射起始地址
+         * 这里还有一种情况是 addr 落在 prev 和 vma 之间的一块未映射区域
+         * 如果这块未映射区域的长度满足 len 大小，那么这段未映射区域可以被本次使用，内核也会从指定的 addr 开始映射
+         */
+        vma = find_vma_prev(mm, addr, &prev);
+        if (mmap_end - len >= addr && addr >= mmap_min_addr &&
+            (!vma || addr + len <= vm_start_gap(vma)) &&
+            (!prev || addr >= vm_end_gap(prev)))
+            return addr;
+    }
+
+    /* 如果明确指定 addr 但是指定的虚拟内存范围是一段无效的区域或者已经存在映射关系，
+     * 那么内核会自动在地址空间中寻找一段合适的虚拟内存范围出来，这段虚拟内存范围的起始地址就不是指定的 addr 了 
+     */
+    info.flags = 0;
+    // VMA 区域长度
+    info.length = len;
+    // 这里定义从哪里开始查找 VMA, 这里会从文件映射与匿名映射区开始查找
+    info.low_limit = mm->mmap_base;
+    // 查找结束位置为进程地址空间的末尾 TASK_SIZE
+    info.high_limit = mmap_end;
+    info.align_mask = 0;
+    return vm_unmapped_area(&info);
+}
+```
+
+`find_vma_prev` 的作用就是根据指定的映射起始地址 addr，在进程地址空间中查找出符合 `addr < vma->vm_end` 条件的第一个 vma 出来（下图中的蓝色部分）。然后在进程地址空间中的 vma 链表 mmap 中，找出它的前驱节点 pprev （下图中的绿色部分）。
+
+![memory](./images/memory138.png)
+
+如果不存在这样一个 vma（addr < vma->vm_end），那么内核直接从指定的 addr 地址处开始映射，这时 pprev 指向进程地址空间中最后一个 vma。
+
+![memory](./images/memory139.png)
+
+如果存在这样一个 vma，那么内核就会判断，该 vma 与其前驱节点 pprev 之间的地址间隙 gap 是否能容纳下一段 len 长度的映射区间，如果可以，那么内核就映射在这个地址间隙 gap 中。如果不可以，内核就需要在 `vm_unmapped_area` 函数中重新到整个进程地址空间中查找出一个 len 长度的空闲映射区域，这种情况下映射区的起始地址就不是指定的 addr 了。
+
+![memory](./images/memory140.png)
+
+![memory](./images/memory141.png)
+
+```c
+struct vm_area_struct *
+find_vma_prev(struct mm_struct *mm, unsigned long addr,
+            struct vm_area_struct **pprev)
+{
+    struct vm_area_struct *vma;
+    // 在进程地址空间 mm 中查找第一个符合 addr < vma->vm_end 的 VMA
+    vma = find_vma(mm, addr);
+
+    if (vma) {
+        // 恰好包含 addr 的 VMA 的前一个虚拟内存区域 
+        *pprev = vma->vm_prev;
+    } else {
+        // 如果当前进程地址空间中，addr 不属于任何一个 VMA ，那么这里的 pprev 指向进程地址空间中最后一个 VMA
+        struct rb_node *rb_node = rb_last(&mm->mm_rb);
+
+        *pprev = rb_node ? rb_entry(rb_node, struct vm_area_struct, vm_rb) : NULL;
+    }
+    // 返回查找到的 vma，不存在则返回 null（内核后续会创建 VMA）
+    return vma;
+}
+
+/* 根据指定地址 addr 在进程地址空间中查找第一个符合 addr < vma->vm_end条件 vma 的操作在 find_vma 函数中进行，
+ * 内核为了高效地在进程地址空间中查找特定条件的 vma，会按照地址的增长方向将所有的 vma 组织在一颗红黑树 mm_rb 中。
+ */
+/* Look up the first VMA which satisfies  addr < vm_end,  NULL if none. */
+struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
+{
+    struct rb_node *rb_node;
+    struct vm_area_struct *vma;
+
+    /* 进程地址空间中缓存了最近访问过的 VMA ，首先从进程地址空间中 VMA 缓存中开始查找，缓存命中率通常大约为 35% ，
+     * 查找条件为：vma->vm_start <= addr && vma->vm_end > addr
+     */
+    vma = vmacache_find(mm, addr);
+    if (likely(vma))
+        return vma;
+
+    /* 进程地址空间中的所有 VMA 被组织在一颗红黑树中，为了方便内核在进程地址空间中查找特定的 VMA
+     * 这里首先需要获取红黑树的根节点，内核会从根节点开始查找
+     */
+    rb_node = mm->mm_rb.rb_node;
+
+    while (rb_node) {
+        struct vm_area_struct *tmp;
+        // 获取位于根节点的 VMA
+        tmp = rb_entry(rb_node, struct vm_area_struct, vm_rb);
+
+        if (tmp->vm_end > addr) {
+            vma = tmp;
+            // 判断 addr 是否恰好落在根节点 VMA 中： vm_start <= addr < vm_end
+            if (tmp->vm_start <= addr)
+                break;
+            // 如果不存在，则继续到左子树中查找
+            rb_node = rb_node->rb_left;
+        } else
+            // 如果根节点的 vm_end <= addr，说明 addr 在根节点 vma 的后边，这种情况则到右子树中继续查找
+            rb_node = rb_node->rb_right;
+    }
+
+    if (vma)
+        // 更新 vma 缓存
+        vmacache_update(addr, vma);
+    // 返回查找到的 vma，如果没有查找到，则返回 Null，表示进程空间中目前还没有这样一个 VMA ,后续需要新建了。
+    return vma;
+}
+
+/*
+ * Search for an unmapped address range.
+ *
+ * We are looking for a range that:
+ * - does not intersect with any VMA;
+ * - is contained within the [low_limit, high_limit) interval;
+ * - is at least the desired size.
+ * - satisfies (begin_addr & align_mask) == (align_offset & align_mask)
+ */
+static inline unsigned long
+vm_unmapped_area(struct vm_unmapped_area_info *info)
+{
+    // 按照进程虚拟内存空间中文件映射与匿名映射区的地址增长方向，分为两个函数，在进程地址空间中查找未映射的 VMA
+    if (info->flags & VM_UNMAPPED_AREA_TOPDOWN)
+        // 当文件映射与匿名映射区的地址增长方向是从上到下逆向增长时（新式布局），采用 topdown 后缀的函数查找
+        return unmapped_area_topdown(info);
+    else
+        // 地址增长方向为从下倒上正向增长（经典布局），采用该函数查找
+        return unmapped_area(info);
+}
+```
+
+寻找的 `unmapped_area` 一定是在文件映射与匿名映射区中某个 vma 与其前驱 vma 之间的地址间隙 gap 中产生的。所以这就要求这个 gap 的长度必须大于等于映射 length，这样才能容纳下要映射的长度。gap 的起始地址 `gap_start` 一般从 prev 节点的末尾开始：`gap_start = vma->vm_prev->vm_end` 。gap 的结束地址 `gap_end` 一般从 vma 的起始地址结束：`gap_end = vma->vm_start` 。在此基础之上，gap 还会受到 `low_limit`（`mm->mmap_base`）和 `high_limit`（`TASK_SIZE`）的地址限制。因此这个 gap 的起始地址 `gap_start` 不能高于 `high_limit - length`，否则从 `gap_start` 地址处开始映射长度 length 的区域就会超出 `high_limit` 的限制。gap 的结束地址 `gap_end` 不能低于 `low_limit + length`，否则映射区域的起始地址就会低于 `low_limit` 的限制。
+
+首先内核会从红黑树中的根节点 vma 开始查找，判断根节点的 vma 与其前驱节点 `vma->vm_prev` 之间的地址间隙 gap 是否满足上述条件，如果根节点 vma 的起始地址 `vma->vm_start` 也就是 `gap_end` 低于了 `low_limit + length` 的限制，那就说明根节点 vma 与其前驱节点之间的 gap 不适合用来作为 `unmapped_area`，否则 `unmapped_area` 的起始地址 `gap_start` 就会低于 `low_limit` 的限制。
+
+![memory](./images/memory142.png)
+
+由于红黑树是按照 vma 的地址增长方向来组织的，左子树中的所有 vma 地址都低于根节点 vma 的地址，右子树的所有 vma 地址均高于根节点 vma 的地址。现在的情况是 `vma->vm_start` 的地址太低了，已经小于了 `low_limit + length` 的限制，所以左子树的 vma 就不用看了，直接从右子树中去查找。如果根节点 vma 的起始地址 `vma->vm_start` 也就是 `gap_end` 高于 `low_limit + length` 的要求，说明 `gap_end` 是符合要求的，但是目前还不能马上对 `gap_start` 的限制要求进行检查，因为需要按照地址从低到高的优先级来查看最合适的 `unmapped_area` 未映射区域，所以需要到左子树中去查找地址更低的 vma。如果在左子树中找到了一个地址最低的 vma，并且这个 vma 与其前驱节点 `vma->vm_prev` 之间的地址间隙 gap 符合上述的三个条件：
+
+1. gap 的长度大于等于映射长度 length ： gap_end - gap_start >= length
+2. gap_end >= low_limit + length 。
+3. gap_start <= high_limit - length。
+
+![memory](./images/memory143.png)
+
+为了避免无效遍历优化性能，内核会将一个 vma 节点以及它所有子树中存在的最大间隙 gap 保存在 `struct vm_area_struct` 结构中的 `rb_subtree_gap` 属性中。当遍历 vma 节点的时候发现：`vma->rb_subtree_gap < length`，那么整棵红黑树都不需要遍历，直接从进程地址空间中最后一个 `vma->vm_end` 处开始映射即可。
+
+```c
+struct vm_area_struct {
+    unsigned long vm_start;     /* Our start address within vm_mm. */
+    unsigned long vm_end;       /* The first byte after our end address within vm_mm. */
+
+    /* linked list of VM areas per task, sorted by address */
+    struct vm_area_struct *vm_next, *vm_prev;
+
+    struct rb_node vm_rb;
+
+    /* 在当前 vma 的红黑树左右子树中的所有节点 vma （包括当前 vma）
+     * 这个集合中的 vma 与其 vm_prev 之间最大的虚拟内存地址 gap （单位字节）保存在 rb_subtree_gap 字段中
+     */
+    unsigned long rb_subtree_gap;
+}
+
+struct mm_struct {
+    // 当前进程虚拟内存空间中，地址最高的一个 VMA 的结束地址位置
+    unsigned long highest_vm_end;   /* highest vma end address */
+}
+
+unsigned long unmapped_area(struct vm_unmapped_area_info *info)
+{
+    /*
+     * We implement the search by looking for an rbtree node that
+     * immediately follows a suitable gap. That is,
+     * - gap_start = vma->vm_prev->vm_end <= info->high_limit - length;
+     * - gap_end   = vma->vm_start        >= info->low_limit  + length;
+     * - gap_end - gap_start >= length
+     */
+
+    struct mm_struct *mm = current->mm;
+    // 寻找未映射区域的参考 vma (该区域以存在映射关系)
+    struct vm_area_struct *vma;
+    /* 未映射区域产生在 vma->vm_prev 与 vma 这两个虚拟内存区域中的间隙 gap 中，length 表示本次映射区域的长度，
+     * low_limit ，high_limit 表示在进程地址空间中哪段地址范围内查找，
+     * 一个地址下限（mm->mmap_base），另一个标识地址上限（TASK_SIZE）
+     * gap_start, gap_end 表示 vma->vm_prev 与 vma 之间的 gap 范围，unmapped_area 将会在这里产生
+     */
+    unsigned long length, low_limit, high_limit, gap_start, gap_end;
+
+    /* gap_start 需要满足的条件：gap_start =  vma->vm_prev->vm_end <= info->high_limit - length
+     * 否则 unmapped_area 将会超出 high_limit 的限制
+     */
+    high_limit = info->high_limit - length;
+
+    /* gap_end 需要满足的条件：gap_end = vma->vm_start >= info->low_limit + length
+     * 否则 unmapped_area 将会超出 low_limit 的限制
+     */
+    low_limit = info->low_limit + length;
+
+    // 首先将 vma 红黑树的根节点作为 gap 的参考 vma
+    if (RB_EMPTY_ROOT(&mm->mm_rb))
+        // 'empty' nodes are nodes that are known not to be inserted in an rbtree
+        goto check_highest;
+    // 获取红黑树根节点的 vma
+    vma = rb_entry(mm->mm_rb.rb_node, struct vm_area_struct, vm_rb);
+
+    /* rb_subtree_gap 为当前 vma 及其左右子树中所有 vma 与其对应 vm_prev 之间最大的虚拟内存地址 gap
+     * 最大的 gap 如果都不能满足映射长度 length 则跳转到 check_highest 处理
+     */
+    if (vma->rb_subtree_gap < length)
+        // 从进程地址空间最后一个 vma->vm_end 地址处开始映射
+        goto check_highest;
+
+    while (true) {
+        // 获取当前 vma 的 vm_start 起始虚拟内存地址作为 gap_end
+        gap_end = vm_start_gap(vma);
+        /* gap_end 需要满足：gap_end >= low_limit，否则 unmapped_area 将会超出 low_limit 的限制
+         * 如果存在左子树，则需要继续到左子树中去查找，因为需要按照地址从低到高的优先级来查看合适的未映射区域
+         */
+        if (gap_end >= low_limit && vma->vm_rb.rb_left) {
+            struct vm_area_struct *left =
+                rb_entry(vma->vm_rb.rb_left,
+                     struct vm_area_struct, vm_rb);
+            // 如果左子树中存在合适的 gap，则继续左子树的查找，否则查找结束，gap 为当前 vma 与其 vm_prev 之间的间隙    
+            if (left->rb_subtree_gap >= length) {
+                vma = left;
+                continue;
+            }
+        }
+        // 获取当前 vma->vm_prev 的 vm_end 作为 gap_start
+        gap_start = vma->vm_prev ? vm_end_gap(vma->vm_prev) : 0;
+check_current:
+        // gap_start 需要满足：gap_start <= high_limit，否则 unmapped_area 将会超出 high_limit 的限制
+        if (gap_start > high_limit)
+            return -ENOMEM;
+
+        if (gap_end >= low_limit &&
+            gap_end > gap_start && gap_end - gap_start >= length)
+            // 找到了合适的 unmapped_area 跳转到 found 处理
+            goto found;
+
+        // 当前 vma 与其左子树中的所有 vma 均不存在一个合理的 gap，那么从 vma 的右子树中继续查找
+        if (vma->vm_rb.rb_right) {
+            struct vm_area_struct *right =
+                rb_entry(vma->vm_rb.rb_right,
+                     struct vm_area_struct, vm_rb);
+            if (right->rb_subtree_gap >= length) {
+                vma = right;
+                continue;
+            }
+        }
+
+        /* 如果在当前 vma 以及它的左右子树中均无法找到一个合适的 gap
+         * 那么这里会从当前 vma 节点向上回溯整颗红黑树，在它的父节点中尝试查找是否有合适的 gap
+         * 因为这时候有可能会有新的 vma 插入到红黑树中，可能会产生新的 gap
+         */
+        while (true) {
+            struct rb_node *prev = &vma->vm_rb;
+            if (!rb_parent(prev))
+                goto check_highest;
+            vma = rb_entry(rb_parent(prev),
+                       struct vm_area_struct, vm_rb);
+            if (prev == vma->vm_rb.rb_left) {
+                gap_start = vm_end_gap(vma->vm_prev);
+                gap_end = vm_start_gap(vma);
+                goto check_current;
+            }
+        }
+    }
+
+check_highest:
+    /* 流程走到这里表示在当前进程虚拟内存空间的所有 VMA 中都无法找到一个合适的 gap 来作为 unmapped_area
+     * 那么就从进程地址空间中最后一个 vma->vm_end 开始映射
+     * mm->highest_vm_end 表示当前进程虚拟内存空间中，地址最高的一个 VMA 的结束地址位置
+     */
+    gap_start = mm->highest_vm_end;
+    gap_end = ULONG_MAX;  /* Only for VM_BUG_ON below */
+    // 这里最后需要检查剩余虚拟内存空间是否满足映射长度
+    if (gap_start > high_limit)
+        // ENOMEM 表示当前进程虚拟内存空间中虚拟内存不足
+        return -ENOMEM;
+
+found:
+    /* 流程走到这里表示我们已经找到了一个合适的 gap 来作为 unmapped_area 
+     * 直接返回 gap_start （需要与 4K 对齐）作为映射的起始地址
+     */
+    /* We found a suitable gap. Clip it with the original low_limit. */
+    if (gap_start < info->low_limit)
+        gap_start = info->low_limit;
+
+    /* Adjust gap address to the desired alignment */
+    gap_start += (info->align_offset - gap_start) & info->align_mask;
+
+    VM_BUG_ON(gap_start + info->length > info->high_limit);
+    VM_BUG_ON(gap_start + info->length > gap_end);
+    return gap_start;
+}
+```
+
+##### 内存映射的本质
+
+![memory](./images/memory146.png)
+
+```c
+unsigned long mmap_region(struct file *file, unsigned long addr,
+        unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
+        struct list_head *uf)
+{
+    struct mm_struct *mm = current->mm;
+    struct vm_area_struct *vma, *prev;
+    int error;
+    struct rb_node **rb_link, *rb_parent;
+    unsigned long charged = 0;
+
+    // 检查本次映射是否超过了进程虚拟内存空间中的虚拟内存容量的限制，超过则返回 false
+    if (!may_expand_vm(mm, vm_flags, len >> PAGE_SHIFT)) {
+        unsigned long nr_pages;
+
+        /* 如果 mmap 指定了 MAP_FIXED，表示内核必须要按照用户指定的映射区来进行映射
+         * 这种情况下就会导致指定的映射区[addr, addr + len] 有一部分可能与现有映射重叠
+         * 内核将会覆盖掉这段已有的映射，重新按照用户指定的映射关系进行映射
+         * 所以这里需要计算进程地址空间中与指定映射区[addr, addr + len]重叠的虚拟内存页数 nr_pages
+         */
+        nr_pages = count_vma_pages_range(mm, addr, addr + len);
+        /* 由于这里的 nr_pages 表示重叠的虚拟内存部分，将会被覆盖，所以这部分被覆盖的虚拟内存不需要额外申请
+         * 这里通过 len >> PAGE_SHIFT 减去这段可以被覆盖的 nr_pages 在重新检查是否超过虚拟内存相关区域的限额
+         */
+        if (!may_expand_vm(mm, vm_flags,
+                    (len >> PAGE_SHIFT) - nr_pages))
+            return -ENOMEM;
+    }
+
+   /* 如果当前进程地址空间中存在于指定映射区域 [addr, addr + len] 重叠的部分
+    * 则调用  do_munmap 将这段重叠的映射部分解除掉，后续会重新映射这部分
+    */
+    while (find_vma_links(mm, addr, addr + len, &prev, &rb_link,
+                  &rb_parent)) {
+        if (do_munmap(mm, addr, len, uf))
+            return -ENOMEM;
+    }
+   
+    /* 判断将来是否会为这段虚拟内存 vma ，申请新的物理内存，
+     * 比如 私有，可写（private writable）的映射方式，内核将来会通过 cow 重新为其分配新的物理内存。
+     * 私有，只读（private readonly）的映射方式，内核则会共享原来映射的物理内存，而不会申请新的物理内存。
+     * 如果将来需要申请新的物理内存则会根据当前系统的 overcommit 策略以及当前物理内存的使用情况来  
+     * 综合判断是否允许本次虚拟内存的申请。如果虚拟内存不足，则返回 ENOMEM，这样的话可以防止缺页的时候发生 OOM
+     */
+    if (accountable_mapping(file, vm_flags)) {
+        charged = len >> PAGE_SHIFT;
+        /* 根据内核 overcommit 策略以及当前物理内存的使用情况综合判断，是否能够通过本次虚拟内存的申请
+         * 虚拟内存的申请一旦这里通过之后，后续发生缺页，内核将会有足够的物理内存为其分配，不会发生 OOM
+         */
+        if (security_vm_enough_memory_mm(mm, charged))
+            return -ENOMEM;
+        /* 凡是设置了 VM_ACCOUNT 的 VMA，表示这段虚拟内存均已经过 vm_enough_memory 的检测
+         * 当虚拟内存发生缺页的时候，内核会有足够的物理内存分配，而不会导致 OOM
+         * 其虚拟内存的用量都会被统计在 /proc/meminfo 的 Committed_AS  字段中  
+         */
+        vm_flags |= VM_ACCOUNT;
+    }
+
+    /* 为了精细化的控制内存的开销，内核这里首先需要尝试看能不能和地址空间中已有的 vma 进行合并
+     * 尝试将当前 vma 合并到已有的 vma 中
+     */
+    vma = vma_merge(mm, prev, addr, addr + len, vm_flags,
+            NULL, file, pgoff, NULL, NULL_VM_UFFD_CTX);
+    if (vma)
+        // 如果可以合并，则虚拟内存分配过程结束
+        goto out;
+
+    // 如果不可以合并，则只能从 slab 中取出一个新的 vma 结构来
+    vma = vm_area_alloc(mm);
+    if (!vma) {
+        error = -ENOMEM;
+        goto unacct_error;
+    }
+    // 根据要映射的虚拟内存区域属性初始化 vma 结构中的相关字段
+    vma->vm_start = addr;
+    vma->vm_end = addr + len;
+    vma->vm_flags = vm_flags;
+    vma->vm_page_prot = vm_get_page_prot(vm_flags);
+    vma->vm_pgoff = pgoff;
+
+    // 文件映射
+    if (file) {
+        // 将文件与虚拟内存映射起来
+        vma->vm_file = get_file(file);
+        /* 这一步中将虚拟内存区域 vma 的操作函数 vm_ops 映射成文件的操作函数（和具体文件系统有关）
+         * 比如 ext4 文件系统中的操作函数为 ext4_file_vm_ops
+         * 从这一刻开始，读写内存就和读写文件是一样的了
+         */
+        error = call_mmap(file, vma);
+        if (error)
+            goto unmap_and_free_vma;
+
+        addr = vma->vm_start;
+        vm_flags = vma->vm_flags;
+    } else if (vm_flags & VM_SHARED) {
+        /* 这里处理共享匿名映射，依赖于 tmpfs 文件系统中的匿名文件，父子进程通过这个匿名文件进行通讯
+         * 该函数用于在 tmpfs 中创建匿名文件，并映射进当前共享匿名映射区 vma 中
+         */
+        error = shmem_zero_setup(vma);
+        if (error)
+            goto free_vma;
+    } else {
+        // 这里处理私有匿名映射，将 vma->vm_ops 设置为 null，只有文件映射才需要 vm_ops 这样才能将内存与文件映射起来
+        vma_set_anonymous(vma);
+    }
+    /* 将当前 vma 按照地址的增长方向插入到进程虚拟内存空间的 mm_struct->mmap 链表以及mm_struct->mm_rb 红黑树中
+     * 并建立文件与 vma 的反向映射
+     */
+    vma_link(mm, vma, prev, rb_link, rb_parent);
+
+    file = vma->vm_file;
+out:
+    // 更新地址空间 mm_struct 中的相关统计变量
+    vm_stat_account(mm, vm_flags, len >> PAGE_SHIFT);
+    return addr;
+}
+```
+
+![memory](./images/memory144.png)
+
+```c
+static inline int call_mmap(struct file *file, struct vm_area_struct *vma)
+{
+    return file->f_op->mmap(file, vma);
+}
+
+// 内核将文件相关的操作全部定义在 struct file 结构中的 f_op 属性中
+struct file {
+    const struct file_operations  *f_op;
+}
+
+/* 文件的操作与其所在的文件系统是紧密相关的，
+ * 在 ext4 文件系统中，相关文件的 file->f_op 指向 ext4_file_operations 操作集合
+ */
+const struct file_operations ext4_file_operations = {
+	.mmap		= ext4_file_mmap,
+};
+
+/* 其中 file->f_op->mmap 函数专门用于文件与内存的映射，在这里内核将 vm_area_struct 的内存操作 vma->vm_ops 
+ * 设置为文件系统的操作 ext4_file_vm_ops，当通过 mmap 将内存与文件映射起来之后，读写内存其实就是读写文件系统的本质就在这里。
+ */
+static int ext4_file_mmap(struct file *file, struct vm_area_struct *vma)
+{
+      ......
+      vma->vm_ops = &ext4_file_vm_ops;
+      ......    
+}
+static const struct vm_operations_struct ext4_file_vm_ops = {
+    .fault      = ext4_filemap_fault,
+    .map_pages  = filemap_map_pages,
+    .page_mkwrite   = ext4_page_mkwrite,
+};
+```
+
+如果 mmap 进行的是共享匿名映射，父子进程之间需要依赖 tmpfs 文件系统中的匿名文件对共享内存进行访问，当进行共享匿名映射的时候，内核会在 `shmem_zero_setup` 函数中，到 tmpfs 文件系统里为映射创建一个匿名文件（`shmem_kernel_file_setup`），随后将 tmpfs 文件系统中的这个匿名文件与虚拟映射区 vma 中的 `vm_file` 关联映射起来，当然了，`vma->vm_ops` 也需要映射成 `shmem_vm_ops`。当父进程调用 fork 创建子进程的时候，内核会将父进程的虚拟内存空间全部拷贝给子进程，包括这里创建的共享匿名映射区域 vma，这样一来，父子进程就可以通过共同的 `vma->vm_file` 来实现共享内存的通信了。这里可以看出 mmap 的共享匿名映射其实本质上还是共享文件映射，只不过这个文件比较特殊，创建于 `dev/zero` 目录下的 tmpfs 文件系统中。
+
+```c
+int shmem_zero_setup(struct vm_area_struct *vma)
+{
+    struct file *file;
+    loff_t size = vma->vm_end - vma->vm_start;
+    // tmpfs 中获取一个匿名文件
+    file = shmem_kernel_file_setup("dev/zero", size, vma->vm_flags);
+    if (IS_ERR(file))
+        return PTR_ERR(file);
+
+    if (vma->vm_file)
+        // 如果 vma 中已存在其他文件，则解除与其他文件的映射关系
+        fput(vma->vm_file);
+    
+    // 将 tmpfs 中的匿名文件映射进虚拟内存区域 vma 中，后续 fork 子进程的时候，父子进程就可以通过这个匿名文件实现共享匿名映射
+    vma->vm_file = file;
+    // 对这块共享匿名映射区相关操作这里直接映射成 shmem_vm_ops
+    vma->vm_ops = &shmem_vm_ops;
+
+    return 0;
+}
+
+static const struct vm_operations_struct shmem_vm_ops = {
+	.fault		= shmem_fault,
+	.map_pages	= filemap_map_pages,
+#ifdef CONFIG_NUMA
+	.set_policy     = shmem_set_policy,
+	.get_policy     = shmem_get_policy,
+#endif
+};
+```
+
+如果 mmap 这里进行的是私有匿名映射的话，情况就变得简单了，由于私有匿名映射并不涉及到与文件之间的映射，所以只需要简单的将 `vma->vm_ops` 设置为 null 即可。
+
+```c
+static inline void vma_set_anonymous(struct vm_area_struct *vma)
+{
+	vma->vm_ops = NULL;
+}
+```
+
+`vma_link` 要做的工作就是按照虚拟内存地址的增长方向，将本次映射产生的 vma 结构插入到进程地址空间这两个数据结构中。
+
+```c
+static void vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
+            struct vm_area_struct *prev, struct rb_node **rb_link,
+            struct rb_node *rb_parent)
+{
+    // 文件 page cache
+    struct address_space *mapping = NULL;
+
+    if (vma->vm_file) {
+        // 获取映射文件的 page cache
+        mapping = vma->vm_file->f_mapping;
+        i_mmap_lock_write(mapping);
+    }
+    // 将 vma 插入到地址空间中的 vma 链表 mm_struct->mmap 以及红黑树 mm_struct->mm_rb 中
+    __vma_link(mm, vma, prev, rb_link, rb_parent);
+    // 建立文件与 vma 的反向映射
+    __vma_link_file(vma);
+
+    if (mapping)
+        i_mmap_unlock_write(mapping);
+
+    // map_count 表示进程地址空间中 vma 的个数
+    mm->map_count++;
+    validate_mm(mm);
+}
+```
+
+除此之外，`vma_link` 还做了一项重要工作，就是通过 `__vma_link_file` 函数建立文件与虚拟内存区域 vma （所有进程）的反向映射关系。匿名页的反向映射还是相对比较复杂的，文件页的反向映射就很简单了，`struct file` 结构中的 `f_mapping` 属性指向了一个非常重要的数据结构 `struct address_space`。
+
+```c
+struct address_space {
+    struct inode        *host;      /* owner: inode, block_device */
+    // page cache
+    struct radix_tree_root  i_pages;    /* cached pages */
+    atomic_t        i_mmap_writable;/* count VM_SHARED mappings */
+    // 文件与 vma 反向映射的核心数据结构，i_mmap 也是一颗红黑树
+    // 在所有进程的地址空间中，只要与该文件发生映射的 vma 均挂在 i_mmap 中
+    struct rb_root_cached   i_mmap;     /* tree of private and shared mappings */
+}
+```
+
+`struct address_space` 结构中有两个非常重要的属性，其中一个是 `i_pages` ，它指向了 page cache。另一个就是 `i_mmap`，它指向的是一颗红黑树，这颗红黑树正是文件页反向映射的核心数据结构，反向映射关系就保存在这里。
+
+![memory](./images/memory145.png)
+
+一个文件可以被多个进程一起映射，这样一来在每个进程的地址空间 `mm_struct` 结构中都会有一个 vma 结构来与这个文件进行映射，与该文件发生映射关系的所有进程地址空间中的 vma 就挂在 `address_space-> i_mmap` 这颗红黑树中，通过它，可以找到所有与该文件进行映射的进程。`__vma_link_file` 函数建立文件页反向映射的核心其实就是将 mmap 映射出的这个 vma 插入到这颗红黑树中。
+
+```c
+static void __vma_link_file(struct vm_area_struct *vma)
+{
+    struct file *file;
+
+    file = vma->vm_file;
+    if (file) {
+        struct address_space *mapping = file->f_mapping;
+        /* address_space->i_mmap 也是一颗红黑树，上面挂着的是与该文件映射的所有 vma（所有进程地址空间）
+         * 这里将 vma 插入到 i_mmap 中，实现文件与 vma 的反向映射
+         */
+        vma_interval_tree_insert(vma, &mapping->i_mmap);
+    }
+}
+```
+
+进程地址空间中对虚拟内存的用量是有限制的，限制分为两个方面：
+
+1. 对进程地址空间中能够映射的虚拟内存页总数做出限制。
+2. 对进程地址空间中数据区的虚拟内存页总数做出限制。
+
+这里的数据区，在内核中定义的是所有私有，可写的虚拟内存区域（栈区除外）：
+
+```c
+/*
+ * Data area - private, writable, not stack
+ */
+static inline bool is_data_mapping(vm_flags_t flags)
+{
+    // 本次需要映射的虚拟内存区域是否是私有，可写的（数据区）
+    return (flags & (VM_WRITE | VM_SHARED | VM_STACK)) == VM_WRITE;
+}
+```
+
+以上两个方面的限制，可以通过修改 `/etc/security/limits.conf` 文件进行调整。
+
+![memory](./images/memory147.png)
+
+内核对进程地址空间中相关区域的虚拟内存用量限制依然保存在 `task_struct->signal_struct->rlim` 数组中，可以通过 `RLIMIT_AS` 以及 `RLIMIT_DATA` 下标进行访问。
+
+```c
+// 进程地址空间中允许映射的虚拟内存总量，单位为字节
+# define RLIMIT_AS		9	/* address space limit */
+// 进程地址空间中允许用于私有可写（private,writable）的虚拟内存总量，单位字节
+# define RLIMIT_DATA	2	/* max data size */
+
+// 检查本次映射是否超过了进程虚拟内存空间中的虚拟内存总量的限制，超过则返回 false
+bool may_expand_vm(struct mm_struct *mm, vm_flags_t flags, unsigned long npages)
+{
+    /* mm->total_vm 表示当前进程地址空间中映射的虚拟内存页总数，npages 表示此次要映射的虚拟内存页个数
+     * rlimit(RLIMIT_AS) 表示进程地址空间中允许映射的虚拟内存总量，单位为字节
+     */
+    if (mm->total_vm + npages > rlimit(RLIMIT_AS) >> PAGE_SHIFT)
+        // 如果映射的虚拟内存页总数超出了内核的限制，那么就返回 false 表示虚拟内存不足
+        return false;
+
+    /* 检查本次映射是否属于数据区域的映射，这里的数据区域指的是私有，可写的虚拟内存区域（栈区除外）
+     * 如果是则需要检查数据区域里的虚拟内存页是否超过了内核的限制
+     * rlimit(RLIMIT_DATA) 表示进程地址空间中允许映射的私有，可写的虚拟内存总量，单位为字节
+     * 如果超过则返回 false，表示数据区虚拟内存不足
+     */
+    if (is_data_mapping(flags) &&
+        mm->data_vm + npages > rlimit(RLIMIT_DATA) >> PAGE_SHIFT) {
+        /* Workaround for Valgrind */
+        if (rlimit(RLIMIT_DATA) == 0 &&
+            mm->data_vm + npages <= rlimit_max(RLIMIT_DATA) >> PAGE_SHIFT)
+            return true;
+
+        pr_warn_once("%s (%d): VmData %lu exceed data ulimit %lu. Update limits%s.\n",
+                 current->comm, current->pid,
+                 (mm->data_vm + npages) << PAGE_SHIFT,
+                 rlimit(RLIMIT_DATA),
+                 ignore_rlimit_data ? "" : " or use boot option ignore_rlimit_data");
+
+        if (!ignore_rlimit_data)
+            return false;
+    }
+
+    return true;
+}
+```
+
+###### overcommit 策略
+
+内核的 overcommit 策略会影响到进程申请虚拟内存的用量，进程对虚拟内存的申请就好比是向银行贷款，在向银行贷款的时候，银行是需要对贷款者的还款能力进行审计的，抵押的资产越优质，银行贷款给的也会越多。同样的道理，进程再向内核申请虚拟内存的时候，也是需要物理内存作为抵押的，因为虚拟内存说到底最终还是要映射到物理内存上的，背后需要物理内存作为支撑，不能无限制的申请。
+
+所以进程在申请虚拟内存的时候，内核也是需要对申请的虚拟内存用量进行审计的，审计的对象就是那些在未来需要为其分配物理内存的虚拟内存。这也是符合常理的，因为只有在未来需要分配新的物理内存的时候，内核才需要综合物理内存的容量来进行审计，从而决定是否为进程分配这么多的虚拟内存，否则将来可能到处都是 OOM。如果未来不需要为这段虚拟内存分配物理内存，那么内核自然不会对虚拟内存用量进行审计。这取决于 mmap 的映射方式。
+
+比如，这段虚拟内存是私有，可写的，那么在未来，当进程对这段虚拟内存进行写入的时候，内核会通过 cow 的方式为其分配新的物理内存，但是这段虚拟内存是共享的或者是只读的话，内核将不会为这段虚拟内存分配新的物理内存，而是继续共享原来已经映射好的物理内存（内核中只有一份）。如果进程在向内核申请的虚拟内存在未来是需要重新分配物理内存的话，比如：私有，可写。那么这种虚拟内存的使用量就需要被内核审计起来，因为物理内存总是有限的，不可能为所有虚拟内存都分配物理内存。内核需要确保能够为这段虚拟内存未来分配足够的物理内存，防止 oom。**这种虚拟内存称之为 account virtual memory**。而进程向内核申请的虚拟内存并不需要内核为其重新分配物理内存的时候（共享或只读），反正不会增加物理内存的使用负担，这种虚拟内存就不需要被内核审计。
+
+```c
+/*
+ * We account for memory if it's a private writeable mapping,
+ * not hugepages and VM_NORESERVE wasn't set.
+ */
+static inline int accountable_mapping(struct file *file, vm_flags_t vm_flags)
+{
+    // hugetlb 类型的大页有其自己的统计方式，不会和普通的虚拟内存统计混合
+    if (file && is_file_hugepages(file))
+        return 0;
+    /* 私有，可写，并且没有设置 VM_NORESERVE 的相关 VMA 是需要被 account 审计起来的。
+     * 这样在后续发生缺页的时候，不会导致 OOM
+     */
+    return (vm_flags & (VM_NORESERVE | VM_SHARED | VM_WRITE)) == VM_WRITE;
+}
+```
+
+**account virtual memory 特指那些私有，可写（private ，writeable）的虚拟内存区域，并且这些虚拟内存区域的 vm_flags 没有设置 VM_NORESERVE 标志位，以及这部分虚拟内存不能是映射大页的**。这部分 account virtual memory 被记录在 `vm_committed_as` 字段中，表示被审计起来的虚拟内存，这些虚拟内存在未来都是需要映射新的物理内存的，站在物理内存的角度 `vm_committed_as` 可以理解为当前系统中已经分配的物理内存和未来可能需要的物理内存总量。
+
+```c
+// 定义在文件：/include/linux/mman.h
+extern struct percpu_counter vm_committed_as;
+
+static inline void vm_acct_memory(long pages)
+{
+	percpu_counter_add_batch(&vm_committed_as, pages, vm_committed_as_batch);
+}
+
+static inline void vm_unacct_memory(long pages)
+{
+	vm_acct_memory(-pages);
+}
+```
+
+每当有进程向内核申请或者释放虚拟内存（account virtual memory ）的时候，内核都会通过 `vm_acct_memory` 和 `vm_unacct_memory` 函数来更新 `vm_committed_as` 的值。使用 mmap 进行内存映射的时候，如果映射出的虚拟内存区域 vma 为私有，可写的，并且参数 flags 没有设置 `MAP_NORESERVE` 标志，那么这部分虚拟内存就需要被记录在 `vm_committed_as` 字段中。`vm_committed_as` 的值最终会反应在 `/proc/meminfo` 中的 Committed_AS 字段上。用来记录当前系统中，所有进程申请到的 account virtual memory 总量。
+
+```c
+static int meminfo_proc_show(struct seq_file *m, void *v)
+{
+    struct sysinfo i;
+    unsigned long committed;
+
+    committed = percpu_counter_read_positive(&vm_committed_as);
+  
+    show_val_kb(m, "Committed_AS:   ", committed);
+}
+```
+
+![memory](./images/memory148.png)
+
+```c
+/* 用于检查进程虚拟内存空间中是否有足够的虚拟内存可供本次申请使用（需要结合 overcommit 策略来综合判定）
+ * 返回 0 表示有足够的虚拟内存，返回 ENOMEM 表示虚拟内存不足
+ */
+int __vm_enough_memory(struct mm_struct *mm, long pages, int cap_sys_admin)
+{
+    // OVERCOMMIT_NEVER 模式下允许进程申请的虚拟内存大小
+    long allowed;
+    // 虚拟内存审计字段 vm_committed_as 增加 pages
+    vm_acct_memory(pages);
+
+    /* 虚拟内存的 overcommit 策略可以通过修改 /proc/sys/vm/overcommit_memory 文件来设置，
+     * 它有三个设置选项：
+     * OVERCOMMIT_ALWAYS 表示无论应用进程申请多大的虚拟内存，内核总是会答应，分配虚拟内存非常的激进
+     */
+    if (sysctl_overcommit_memory == OVERCOMMIT_ALWAYS)
+        return 0;
+    /* OVERCOMMIT_GUESS 则相对 always 策略稍微保守一点，也是内核的默认策略
+     * 它会对进程能够申请到的虚拟内存大小做一定的限制，特别激进的申请比如申请非常大的虚拟内存则会被拒绝。
+     */
+    if (sysctl_overcommit_memory == OVERCOMMIT_GUESS) {
+        // guess 默认策略下，进程申请的虚拟内存大小不能超过 物理内存总大小和 swap 交换区的总大小之和
+        if (pages > totalram_pages() + total_swap_pages)
+            goto error;
+        return 0;
+    }
+
+    /* OVERCOMMIT_NEVER 是最为严格的一种控制虚拟内存 overcommit 的策略
+     * 进程申请的虚拟内存大小不能超过 vm_commit_limit()，该值也会反应在 /proc/meminfo 中的 CommitLimit 字段中。
+     * 只有采用 OVERCOMMIT_NEVER 模式，CommitLimit 的限制才会生效
+     * allowed =（总物理内存大小 - 大页占用的内存大小） * 50%  + swap 交换区总大小 
+     */
+    allowed = vm_commit_limit();
+
+    // cap_sys_admin 表示申请内存的进程拥有 root 权限
+    if (!cap_sys_admin)
+        /* 为 root 进程保存一些内存，这样可以保证 root 相关的操作在任何时候都可以顺利进行
+         * 大小为 sysctl_admin_reserve_kbytes，这部分内存普通进程不能申请使用
+         * 可通过 /proc/sys/vm/admin_reserve_kbytes 来配置
+         */
+        allowed -= sysctl_admin_reserve_kbytes >> (PAGE_SHIFT - 10);
+
+    /*
+     * Don't let a single process grow so big a user can't recover
+     */
+    if (mm) {
+        /* 可通过 /proc/sys/vm/user_reserve_kbytes 来配置
+         * 用于在紧急情况下，用户恢复系统，比如系统卡死，用户主动 kill 资源消耗比较大的进程，
+         * 这个动作需要预留一些 user_reserve 内存
+         */
+        long reserve = sysctl_user_reserve_kbytes >> (PAGE_SHIFT - 10);
+
+        allowed -= min_t(long, mm->total_vm / 32, reserve);
+    }
+    /* Committed_AS （系统中所有进程已经申请的虚拟内存总量 + 本次 mmap 申请的）不可以超过 CommitLimit（allowed）
+     * 所以在 OVERCOMMIT_NEVER 策略下，进程可以申请到的虚拟内存容量需要在 CommitLimit 的基础上再减去
+     * sysctl_admin_reserve_kbytes 和 sysctl_user_reserve_kbytes 配置的预留容量。
+     */
+    if (percpu_counter_read_positive(&vm_committed_as) < allowed)
+        return 0;
+error:
+    vm_unacct_memory(pages);
+
+    return -ENOMEM;
+}
+
+/*
+ * Committed memory limit enforced when OVERCOMMIT_NEVER policy is used
+ */
+unsigned long vm_commit_limit(void)
+{
+    // 允许申请的虚拟内存大小，单位为页
+    unsigned long allowed;
+    /* 该值可通过 /proc/sys/vm/overcommit_kbytes 来修改
+     * sysctl_overcommit_kbytes 设置的是 Committed memory limit 的绝对值
+     */
+    if (sysctl_overcommit_kbytes)
+        // 转换单位为页
+        allowed = sysctl_overcommit_kbytes >> (PAGE_SHIFT - 10);
+    else
+        /* sysctl_overcommit_ratio 该值可通过 /proc/sys/vm/overcommit_ratio 来修改，设置的 commit limit 的比例
+         * 默认值为 50，（总物理内存大小 - 大页占用的内存大小） * 50%
+         */
+        allowed = ((totalram_pages() - hugetlb_total_pages())
+               * sysctl_overcommit_ratio / 100);
+
+    // 最后都需要加上 swap 交换区的总大小
+    allowed += total_swap_pages;
+    // （总物理内存大小 - 大页占用的内存大小） * 50%  + swap 交换区总大小 
+    return allowed;
+}
+```
+
+###### vma 合并
+
+在创建新的 vma 结构之前，内核会在这里尝试看能不能将 area 与现有的 vma 进行合并，这样就可以避免创建新的 vma 结构，节省了内存的开销。内核会本着合并最大化的原则，检查当前映射出来的 area 能否与其前后两个 vma 进行合并，能合并就合并，如果不能合并就只能从 slab 中申请新的 vma 结构了。合并条件如下：
+
+1. area 的 vm_flags 不能设置 VM_SPECIAL 标志，该标志表示 area 区域是不可以被合并的，只能重新创建 vma。
+2. area 的起始地址 addr 必须要与其 prev vma 的结束地址重合，这样，area 才能和它的前一个 vma 进行合并，如果不重合，area 则不能和前一个 vma 进行合并。
+3. area 的结束地址 end 必须要与其 next vma 的起始地址重合，这样，area 才能和它的后一个 vma 进行合并，如果不重合，area 则不能和后一个 vma 进行合并。如果前后都不能合并，那就只能重新创建 vma 结构了。
+4. area 需要与其要合并区域的 vm_flags 必须相同，否则不能合并。
+5. 如果两个合并区域都是文件映射区，那么它们映射的文件必须是同一个，并且他们的文件映射偏移 vm_pgoff 必须是连续的。
+6. 如果两个合并区域都是匿名映射区，那么两个 vma 映射的匿名页 anon_vma 必须是相同的。
+7. 合并区域的 numa policy 必须是相同的。
+8. 要合并的 prev 和 next 虚拟内存区域中，不能包含 close 操作，也就是说 vma->vm_ops 不能设置有 close 函数，如果虚拟内存区域操作支持 close，则不能合并，否则会导致现有虚拟内存区域 prev 和 next 的资源无法释放。
+
+通过 mmap 在进程地址空间中映射出的这个 area 一般是在两个 vma 中产生的，内核源码中使用 prev 指向 area 的前一个 vma，使用 next 指向 area 的后一个 vma。
+
+![memory](./images/memory149.png)
+
+如果在 mmap 系统调用参数 flags 中设置了 MAP_FIXED 标志，表示需要内核进行强制映射，在这种情况下，area 区域有可能会与 prev 区域和 next 区域有部分重合。如果 area 区域的结束地址 end 与 next 区域的结束地址重合，内核会将 next 指针继续向后移动一下，指向 next->vm_next 区域。保证 area 始终处于 prev 和 next 之间的 gap 中。
+
+![memory](./images/memory150.png)
+
+可以合并 vma 一共有 8 种情况，可以分为两个大的类别：
+
+1. 第一个类别是 area 的前一个 prev vma 的结束地址与 area 的起始地址 addr 重合，判断条件为：`prev->vm_end == addr`。
+2. 第二个类别是 area 的后一个 next vma 的起始地址与 area 的结束地址 end 重合，判断条件为：`end == next->vm_start`。
+
+![memory](./images/memory151.png)
+
+case 1 是在基本布局 1 中，area 的起始地址 addr 与 prev vma 的结束地址重合，同时 area 的结束地址 end 与 next vma 的起始地址重合，内核将会删除 next 区域，扩充 prev 区域，也就是说将这三个区域统一合并到 prev 区域中。case 1 在基本布局 2 下，就演变成了 case 6 的情况，内核会将中间重叠的蓝色区域覆盖掉，然后统一合并到 prev 区域中。
+
+![memory](./images/memory152.png)
+
+如果只是 area 的起始地址 addr 与 prev vma 的结束地址重合，但是 area 的结束地址 end 不与 next vma 的起始地址重合，就会出现 case 2 , case 5 , case 7 三种情况。其中 case 2 的情况是 area 的结束地址 end 小于 next vma 的起始地址，内核会扩充 prev 区域，将 area 合并进去，next 区域保持不变。
+
+![memory](./images/memory153.png)
+
+case 5 的情况是 area 的结束地址 end 大于 next vma 的起始地址，内核会扩充 prev 区域，将 area 以及与 next 重叠的部分合并到 prev 区域中，剩下的继续留在 next 区域保持不变。
+
+![memory](./images/memory154.png)
+
+case 2 在基本布局 2 下又会演变成 case 7 , 这种情况下内核会将下图中的蓝色区域覆盖，并扩充 prev 区域。next 区域保持不变。
+
+![memory](./images/memory155.png)
+
+如果只是 area 的结束地址 end 与 next vma 的起始地址重合，但是 area 的起始地址 addr 不与 prev vma 的结束地址重合，同样的道理也会分为三种情况，分别是下面介绍的 case 4 , case 3 , case 8。case 4 的情况下，area 的起始地址 addr 小于 prev 区域的结束地址，那么内核会缩小 prev 区域，然后扩充 next 区域，将重叠的部分合并到 next 区域中。
+
+![memory](./images/memory156.png)
+
+如果 area 的起始地址 addr 大于 prev 区域的结束地址的话，就是 case 3 的情况 ，内核会扩充 next 区域，并将 area 合并到 next 中，prev 区域保持不变。
+
+![memory](./images/memory157.png)
+
+case 3 在基本布局 2 下就会演变为 case 8 ，内核继续保持 prev 区域不变，然后扩充 next 区域并覆盖下图中蓝色部分，将 area 合并到 next 区域中。
+
+![memory](./images/memory158.png)
+
+```c
+struct vm_area_struct *vma_merge(struct mm_struct *mm,
+            struct vm_area_struct *prev, unsigned long addr,
+            unsigned long end, unsigned long vm_flags,
+            struct anon_vma *anon_vma, struct file *file,
+            pgoff_t pgoff, struct mempolicy *policy,
+            struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
+{
+    // 本次需要创建的 VMA 区域大小
+    pgoff_t pglen = (end - addr) >> PAGE_SHIFT;
+    /* area 表示当前要创建的 VMA，next 表示 area 的下一个 VMA
+     * 事实上 area 会在其 prev 前一个 VMA 和 next 后一个 VMA 之间的间隙 gap 中创建产生
+     */
+    struct vm_area_struct *area, *next;
+    int err;
+
+    // 设置了 VM_SPECIAL 表示 area 区域是不可以被合并的，只能重新创建 VMA，直接退出合并流程。
+    if (vm_flags & VM_SPECIAL)
+        return NULL;
+    // 根据 prev vma 是否存在，设置 area 的 next vma，基本布局 1
+    if (prev)
+        // area 将在 prev vma 和 next vma 的间隙 gap 中产生
+        next = prev->vm_next;
+    else
+        // 如果 prev 不存在，那么 next 就设置为地址空间中的第一个 vma。
+        next = mm->mmap;
+
+    area = next;
+    /* 新 vma 的 end 与 next->vm_end 相等 ，表示新 vma 与 next vma 是重合的，基本布局 2
+     * 那么 next 指向下一个 vma，prev 和 next 这里的语义是始终指向 area 区域的前一个和后一个 vma
+     */
+    if (area && area->vm_end == end)        /* cases 6, 7, 8 */
+        next = next->vm_next;
+ 
+    // 判断 area 是否能够和 prev 进行合并
+    if (prev && prev->vm_end == addr &&
+            mpol_equal(vma_policy(prev), policy) &&
+            can_vma_merge_after(prev, vm_flags,
+                        anon_vma, file, pgoff,
+                        vm_userfaultfd_ctx)) {
+
+        /* 如何 area 可以和 prev 进行合并，那么这里继续判断 area 能够与 next 进行合并
+         * 内核这里需要保证 vma 合并程度的最大化
+         */
+        if (next && end == next->vm_start &&
+                mpol_equal(policy, vma_policy(next)) &&
+                can_vma_merge_before(next, vm_flags,
+                             anon_vma, file,
+                             pgoff+pglen,
+                             vm_userfaultfd_ctx) &&
+                is_mergeable_anon_vma(prev->anon_vma,
+                              next->anon_vma, NULL)) { // cases 1,6
+            /* 流程走到这里表示 area 可以和它的 prev ，next 区域进行合并
+             * __vma_adjust 是真正执行 vma 合并操作的函数，这里会重新调整已有 vma 的相关属性，比如：
+             * vm_start,vm_end,vm_pgoff。以及涉及到相关数据结构的改变
+             */
+            err = __vma_adjust(prev, prev->vm_start,
+                     next->vm_end, prev->vm_pgoff, NULL,
+                     prev);
+        } else                  /* cases 2, 5, 7 */
+            // 流程走到这里表示 area 只能和 prev 进行合并
+            err = __vma_adjust(prev, prev->vm_start,
+                     end, prev->vm_pgoff, NULL, prev);
+        if (err)
+            return NULL;
+        khugepaged_enter_vma_merge(prev, vm_flags);
+        // 返回最终合并好的 vma
+        return prev;
+    }
+
+    /* 下面这种情况属于，area 的结束地址 end 与 next 的起始地址是重合的
+     * 但是 area 的起始地址 start 和 prev 的结束地址不是重合的
+     */
+    if (next && end == next->vm_start &&
+            mpol_equal(policy, vma_policy(next)) &&
+            can_vma_merge_before(next, vm_flags,
+                         anon_vma, file, pgoff+pglen,
+                         vm_userfaultfd_ctx)) {
+        // area 区域前半部分和 prev 区域的后半部分重合，那么就缩小 prev 区域，然后将 area 合并到 next 区域
+        if (prev && addr < prev->vm_end)    /* case 4 */
+            err = __vma_adjust(prev, prev->vm_start,
+                     addr, prev->vm_pgoff, NULL, next);
+        else {                  /* cases 3, 8 */
+            // area 区域前半部分和 prev 区域是有间隙 gap 的，那么这种情况下 prev 不变，area 合并到 next 中
+            err = __vma_adjust(area, addr, next->vm_end,
+                     next->vm_pgoff - pglen, NULL, next);
+            // 合并后的 area
+            area = next;
+        }
+        if (err)
+            return NULL;
+        khugepaged_enter_vma_merge(area, vm_flags);
+        // 返回合并后的 vma
+        return area;
+    }
+    
+    /* prev 的结束地址不与 area 的起始地址重合，并且 area 的结束地址不与 next 的起始地址重合
+     * 这种情况就不能执行合并，需要为 area 重新创建新的 vma 结构
+     */
+    return NULL;
+}
+
+static int
+can_vma_merge_after(struct vm_area_struct *vma, unsigned long vm_flags,
+            struct anon_vma *anon_vma, struct file *file,
+            pgoff_t vm_pgoff,
+            struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
+{
+    // 判断参数中指定的 vma 能否与其后一个 vma 进行合并
+    if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx) &&
+        is_mergeable_anon_vma(anon_vma, vma->anon_vma, vma)) {
+        pgoff_t vm_pglen;
+        // vma 区域的长度
+        vm_pglen = vma_pages(vma);
+        // 判断 vma 和 next 两个文件映射区域的映射偏移 pgoff 是否是连续的
+        if (vma->vm_pgoff + vm_pglen == vm_pgoff)
+            return 1;
+    }
+    return 0;
+}
+
+static inline int is_mergeable_vma(struct vm_area_struct *vma,
+                struct file *file, unsigned long vm_flags,
+                struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
+{
+    /* 对比 prev 和 area 的 vm_flags 是否相同，这里需要排除 VM_SOFTDIRTY
+     * VM_SOFTDIRTY 用于追踪进程写了哪些内存页，如果 prev 被标记了 soft dirty，
+     * 那么合并之后的 vma 也应该继续保留 soft dirty 标记
+     */
+    if ((vma->vm_flags ^ vm_flags) & ~VM_SOFTDIRTY)
+        return 0;
+    // prev 和 area 如果是文件映射区的话，这里需要检查两者映射的文件是否相同
+    if (vma->vm_file != file)
+        return 0;
+    /* 如果 prev 虚拟内存区域中包含了 close 的操作，后续可能会释放 prev 的资源
+     * 所以这种情况下不能和 prev 进行合并，否则就会导致 prev 的资源无法释放
+     */
+    if (vma->vm_ops && vma->vm_ops->close)
+        return 0;
+    /* userfaultfd 是用来在用户态实现缺页处理的机制，这里需要保证两者的 userfaultfd 相同
+     * 不过在 mmap_region 中传入的 vm_userfaultfd_ctx 为 null，这里我们不需要关注
+     */
+    if (!is_mergeable_vm_userfaultfd_ctx(vma, vm_userfaultfd_ctx))
+        return 0;
+    return 1;
+}
+```
+
+### Page Fault
+
+![memory](./images/memory159.png)
+
+当 mmap 系统调用成功返回之后，内核只是为进程分配了一段 [vm_start , vm_end] 范围内的虚拟内存区域 vma ，由于还未与物理内存发生关联，所以此时进程页表中与 mmap 映射的虚拟内存相关的各级页目录和页表项还都是空的。当 CPU 访问这段由 mmap 映射出来的虚拟内存区域 vma 中的任意虚拟地址时，MMU 在遍历进程页表的时候就会发现，该虚拟内存地址在进程顶级页目录 PGD（Page Global Directory）中对应的页目录项 pgd_t 是空的，该 pgd_t 并没有指向其下一级页目录 PUD（Page Upper Directory）。也就是说，此时进程页表中只有一张顶级页目录表 PGD，而上层页目录 PUD（Page Upper Directory），中间页目录 PMD（Page Middle Directory），一级页表（Page Table）内核都还没有创建。
+
+由于现在被访问到的虚拟内存地址对应的 pgd_t 是空的，进程的四级页表体系还未建立，所以 MMU 会产生一个缺页中断，进程从用户态转入内核态来处理这个缺页异常。此时 CPU 会将发生缺页异常时，进程正在使用的相关寄存器中的值压入内核栈中。比如，x86 架构下引起进程缺页异常的虚拟内存地址会被存放在 CR2 寄存器中，同时 CPU 还会将缺页异常的错误码 error_code 压入内核栈中。arm 架构下虚拟地址作为入参 addr ，异常类型保存在 ESR 寄存器中。随后内核会在 `do_page_fault` 函数中来处理缺页异常，该函数的参数都是内核在处理缺页异常的时候需要用到的基本信息：
+
+```c
+// x86
+dotraplinkage void do_page_fault(struct pt_regs *regs, unsigned long error_code, unsigned long address)
+
+// arm64
+static int __kprobes do_page_fault(unsigned long addr, unsigned int esr, struct pt_regs *regs)
+```
+
+![memory](./images/memory160.png)
+
+`struct pt_regs` 结构中存放的是缺页异常发生时，正在使用中的寄存器值的集合。address 表示触发缺页异常的虚拟内存地址。error_code 是对缺页异常的一个描述，目前内核只使用了 `error_code` 的前六个比特位来描述引起缺页异常的具体原因。
+
+`P(0)` : 如果 error_code 第 0 个比特位置为 0 ，表示该缺页异常是由于 CPU 访问的这个虚拟内存地址 address 背后并没有一个物理内存页与之映射而引起的，站在进程页表的角度来说，就是 CPU 访问的这个虚拟内存地址 address 在进程四级页表体系中对应的各级页目录项或者页表项是空的（页目录项或者页表项中的 P 位为 0 ）。如果 error_code 第 0 个比特位置为 1，表示 CPU 访问的这个虚拟内存地址背后虽然有物理内存页与之映射，但是由于访问权限不够而引起的缺页异常（保护异常），比如，进程尝试对一个只读的物理内存页进行写操作，那么就会引起写保护类型的缺页异常。
+
+`R/W(1)` : 表示引起缺页异常的访问类型。如果 error_code 第 1 个比特位置为 0，表示是由于读访问引起的。置为 1 表示是由于写访问引起的。该标志位只是为了描述是哪种访问类型造成了本次缺页异常，这个和前面提到的访问权限没有关系。比如，进程尝试对一个可写的虚拟内存页进行写入，访问权限没有问题，但是该虚拟内存页背后并未有物理内存与之关联，所以也会导致缺页异常。这种情况下，error_code 的 P 位就会设置为 0，R/W 位就会设置为 1 。
+
+`U/S(2)`：表示缺页异常发生在用户态还是内核态，error_code 第 2 个比特位设置为 0 表示 CPU 访问内核空间的地址引起的缺页异常，设置为 1 表示 CPU 访问用户空间的地址引起的缺页异常。
+
+`RSVD(3)`：这里用于检测页表项中的保留位（Reserved 相关的比特位）是否设置，这些页表项中的保留位都是预留给内核以后的相关功能使用的，所以在缺页的时候需要检查这些保留位是否设置，从而决定近一步的扩展处理。设置为 1 表示页表项中预留的这些比特位被使用了。设置为 0 表示页表项中预留的这些比特位还没有被使用。
+
+`I/D(4)`：设置为 1 ，表示本次缺页异常是在 CPU 获取指令的时候引起的。
+
+`PK(5)`：设置为 1，表示引起缺页异常的虚拟内存地址对应页表项中的 Protection 相关的比特位被设置了。
+
+error_code 比特位的含义定义在文件 `/arch/x86/include/asm/traps.h` 中：
+
+```c
+/*
+ * Page fault error code bits:
+ *
+ *   bit 0 ==	 0: no page found	1: protection fault
+ *   bit 1 ==	 0: read access		1: write access
+ *   bit 2 ==	 0: kernel-mode access	1: user-mode access
+ *   bit 3 ==				1: use of reserved bit detected
+ *   bit 4 ==				1: fault was an instruction fetch
+ *   bit 5 ==				1: protection keys block access
+ */
+enum x86_pf_error_code {
+	X86_PF_PROT	=		1 << 0,
+	X86_PF_WRITE	=		1 << 1,
+	X86_PF_USER	=		1 << 2,
+	X86_PF_RSVD	=		1 << 3,
+	X86_PF_INSTR	=		1 << 4,
+	X86_PF_PK	=		1 << 5,
+};
+```
+
+缺页中断产生的根本原因是由于 CPU 访问的这段虚拟内存背后没有物理内存与之映射，表现的具体形式主要有三种：
+
+1. 虚拟内存对应在进程页表体系中的相关各级页目录或者页表是空的，也就是说这段虚拟内存完全没有被映射过。
+2. 虚拟内存之前被映射过，其在进程页表的各级页目录以及页表中均有对应的页目录项和页表项，但是其对应的物理内存被内核 swap out 到磁盘上了。
+3. 虚拟内存虽然背后映射着物理内存，但是由于对物理内存的访问权限不够而导致的保护类型的缺页中断。比如，尝试去写一个只读的物理内存页。
+
+ p4d 的页目录用于在五级页表体系下表示四级页目录。而在四级页表体系下，这个 p4d 就不起作用了，但为了代码上的统一处理，在四级页表下，前面定位到的顶级页目录项 pgd_t 会赋值给四级页目录项 p4d_t，后续处理都会将 p4d_t 看做是顶级页目录项。
+
+```c
+typedef unsigned long	p4dval_t;
+typedef struct { p4dval_t p4d; } p4d_t;
+
+static inline p4d_t *p4d_alloc(struct mm_struct *mm, pgd_t *pgd,
+		unsigned long address)
+{
+    // 一般情况下 pgd 不为空，且在四级页表体系下，直接返回 pgd 的地址
+	return (unlikely(pgd_none(*pgd)) && __p4d_alloc(mm, pgd, address)) ?
+		NULL : p4d_offset(pgd, address);
+}
+```
+
+![memory](./images/memory166.png)
+
+如果通过 p4d_none 函数判断出顶级页目录项 p4d 是空的，那么就需要调用 __pud_alloc 函数分配一个新的上层页目录表 PUD 出来，然后用 PUD 的起始物理内存地址以及页目录项的初始权限位 PUD_TYPE_TABLE 填充 p4d。
+
+```c
+static inline pud_t *pud_alloc(struct mm_struct *mm, p4d_t *p4d,
+		unsigned long address)
+{
+	return (unlikely(p4d_none(*p4d)) && __pud_alloc(mm, p4d, address)) ?
+		NULL : pud_offset(p4d, address);
+}
+
+/*
+ * Allocate page upper directory.
+ * We've already handled the fast-path in-line.
+ */
+int __pud_alloc(struct mm_struct *mm, p4d_t *p4d, unsigned long address)
+{
+    // 调用 get_zeroed_page 申请一个 4k 物理内存页并初始化为 0 值作为新的 PUD ，new 指向新分配的 PUD 起始内存地址
+    pud_t *new = pud_alloc_one(mm, address);
+    if (!new)
+        return -ENOMEM;
+    // 操作进程页表需要加锁
+    spin_lock(&mm->page_table_lock);
+    // 如果顶级页目录项 p4d 中的 P 比特位置为 0 表示 p4d 目前还没有指向其下一级页目录 PUD，下面需要填充 p4d
+    if (!p4d_present(*p4d)) {
+        /* 更新 mm->pgtables_bytes 计数，该字段用于统计进程页表所占用的字节数
+         * 由于这里新增了一张 PUD 目录表，所以计数需要增加 PTRS_PER_PUD * sizeof(pud_t)
+         */
+        mm_inc_nr_puds(mm);
+        // 将 new 指向的新分配出来的 PUD 物理内存地址以及相关属性填充到顶级页目录项 p4d 中
+        p4d_populate(mm, p4d, new);
+    } else  /* Another has populated it */
+        // 释放新创建的 PMD
+        pud_free(mm, new);
+
+    // 释放页表锁
+    spin_unlock(&mm->page_table_lock);
+    return 0;
+}
+
+static inline void p4d_populate(struct mm_struct *mm, p4d_t *p4dp, pud_t *pudp)
+{
+	__p4d_populate(p4dp, __pa(pudp), PUD_TYPE_TABLE);
+}
+
+static inline void __p4d_populate(p4d_t *p4dp, phys_addr_t pudp, p4dval_t prot)
+{
+	set_p4d(p4dp, __p4d(__phys_to_p4d_val(pudp) | prot));
+}
+
+static inline void set_p4d(p4d_t *p4dp, p4d_t p4d)
+{
+    // 内核地址空间
+	if (in_swapper_pgdir(p4dp)) {
+		set_swapper_pgd((pgd_t *)p4dp, __pgd(p4d_val(p4d)));
+		return;
+	}
+
+	WRITE_ONCE(*p4dp, p4d);
+	dsb(ishst);
+	isb();
+}
+
+/* Find an entry in the third-level page table.. */
+static inline pud_t *pud_offset(p4d_t *p4d, unsigned long address)
+{
+	return (pud_t *)p4d_page_vaddr(*p4d) + pud_index(address);
+}
+```
+
+![memory](./images/memory167.png)
+
+```c
+static inline pmd_t *pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long address)
+{
+	return (unlikely(pud_none(*pud)) && __pmd_alloc(mm, pud, address))?
+		NULL: pmd_offset(pud, address);
+}
+
+/*
+ * Allocate page middle directory.
+ * We've already handled the fast-path in-line.
+ */
+int __pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long address)
+{
+    // 调用 alloc_pages 从伙伴系统申请一个 4K 大小的物理内存页，作为新的 PMD
+    pmd_t *new = pmd_alloc_one(mm, address);
+    if (!new)
+        return -ENOMEM;
+    // 如果 pud 还未指向其下一级页目录 PMD，则需要初始化填充 pud
+    if (!pud_present(*pud)) {
+        mm_inc_nr_pmds(mm);
+        // 将 new 指向的新分配出来的 PMD 物理内存地址以及相关属性填充到上层页目录项 pud 中
+        pud_populate(mm, pud, new);
+    } else  /* Another has populated it */
+        pmd_free(mm, new);
+
+    return 0;
+}
+
+static inline void pud_populate(struct mm_struct *mm, pud_t *pudp, pmd_t *pmdp)
+{
+	__pud_populate(pudp, __pa(pmdp), PMD_TYPE_TABLE);
+}
+
+static inline void __pud_populate(pud_t *pudp, phys_addr_t pmdp, pudval_t prot)
+{
+	set_pud(pudp, __pud(__phys_to_pud_val(pmdp) | prot));
+}
+
+static inline void set_pud(pud_t *pudp, pud_t pud)
+{
+#ifdef __PAGETABLE_PUD_FOLDED
+	if (in_swapper_pgdir(pudp)) {
+		set_swapper_pgd((pgd_t *)pudp, __pgd(pud_val(pud)));
+		return;
+	}
+#endif /* __PAGETABLE_PUD_FOLDED */
+
+	WRITE_ONCE(*pudp, pud);
+
+	if (pud_valid(pud)) {
+		dsb(ishst);
+		isb();
+	}
+}
+
+static inline pmd_t *pmd_offset(pud_t *pud, unsigned long address)
+{
+	return (pmd_t *)pud_page_vaddr(*pud) + pmd_index(address);
+}
+```
+
+![memory](./images/memory168.png)
+
+```c
+static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+        unsigned long address, unsigned int flags)
+{
+    // vm_fault 结构用于封装后续缺页处理用到的相关参数
+    struct vm_fault vmf = {
+        // 发生缺页的 vma
+        .vma = vma,
+        // 引起缺页的虚拟内存地址
+        .address = address & PAGE_MASK,
+        // 处理缺页的相关标记 FAULT_FLAG_xxx
+        .flags = flags,
+        // address 在 vma 中的偏移，单位也页
+        .pgoff = linear_page_index(vma, address),
+        // 后续用于分配物理内存使用的相关掩码 gfp_mask
+        .gfp_mask = __get_fault_gfp_mask(vma),
+    };
+    // 获取进程虚拟内存空间
+    struct mm_struct *mm = vma->vm_mm;
+    // 进程页表的顶级页表地址
+    pgd_t *pgd;
+    // 五级页表下会使用，在四级页表下 p4d 与 pgd 的值一样
+    p4d_t *p4d;
+    vm_fault_t ret;
+    // 获取 address 在全局页目录表 PGD 中对应的目录项 pgd
+    pgd = pgd_offset(mm, address);
+    // 在四级页表下，这里只是将 pgd 赋值给 p4d，后续均已 p4d 作为全局页目录项
+    p4d = p4d_alloc(mm, pgd, address);
+    if (!p4d)
+        return VM_FAULT_OOM;
+    /* 首先 p4d_none 判断全局页目录项 p4d 是否是空的
+     * 如果 p4d 是空的，则调用 __pud_alloc 分配一个新的上层页目录表 PUD，然后填充 p4d
+     * 如果 p4d 不是空的，则调用 pud_offset 获取 address 在上层页目录 PUD 中的目录项 pud
+     */
+    vmf.pud = pud_alloc(mm, p4d, address);
+    if (!vmf.pud)
+        return VM_FAULT_OOM;
+  
+    // 省略 1G 大页缺页处理
+    
+    /* 首先 pud_none 判断上层页目录项 pud 是不是空的
+     * 如果 pud 是空的，则调用 __pmd_alloc 分配一个新的中间页目录表 PMD，然后填充 pud
+     * 如果 pud 不是空的，则调用 pmd_offset 获取 address 在中间页目录 PMD 中的目录项 pmd
+     */
+    vmf.pmd = pmd_alloc(mm, vmf.pud, address);
+    if (!vmf.pmd)
+        return VM_FAULT_OOM;
+
+    // 省略 2M 大页缺页处理
+
+    // 进行页表的相关处理以及解析具体的缺页原因，后续针对性的进行缺页处理
+    return handle_pte_fault(&vmf);
+}
+```
+
+从总体上来讲引起缺页中断的原因分为两大类，一类是缺页虚拟内存地址背后映射的物理内存页不在内存中，另一类是缺页虚拟内存地址背后映射的物理内存页在内存中。下面先来看第一类，其中分为了三种缺页场景。第一种场景是，缺页虚拟内存地址 address 在进程页表中间页目录对应的页目录项 pmd_t 是空的，可以通过 pmd_none 方法来判断。这种情况表示缺页地址 address 对应的 pmd 目前还没有对应的页表，连页表都还没有，那么自然 pte 也是空的，物理内存页就更不用说了，肯定还没有。
+
+```c
+#define pmd_none(pmd)		(!pmd_val(pmd))
+#define pmd_val(x)	((x).pmd)
+```
+
+第二种场景是，缺页地址 address 对应的 pmd_t 虽然不是空的，页表也存在，但是 address 对应在页表中的 pte 是空的。内核中通过 `pte_offset_map` 定位 address 在页表中的 pte 。这种情况下，虽然页表是存在的，但是 address 在页表中的 pte 是空的，和第一种场景一样，都说明了该 address 之前从来还没有被映射过。
+
+```c
+#define pte_offset_map(dir, address) pte_offset_kernel((dir), (address))
+
+static inline pte_t *pte_offset_kernel(pmd_t *pmd, unsigned long address)
+{
+	return (pte_t *)pmd_page_vaddr(*pmd) + pte_index(address);
+}
+
+static inline unsigned long pte_index(unsigned long address)
+{
+	return (address >> PAGE_SHIFT) & (PTRS_PER_PTE - 1);
+}
+
+#define PAGE_SHIFT   12
+// 页表可以容纳的页表项 pte_t 的个数
+#define PTRS_PER_PTE  512
+```
+
+![memory](./images/memory169.png)
+
+既然之前都没有被映射，那么现在就该把这块内容补齐。内核总共四种内存映射方式，分别为：私有匿名映射，私有文件映射，共享文件映射，共享匿名映射。这四种内存映射方式从总体上来说分为两类：一类是匿名映射，另一类是文件映射。匿名映射在分配 VMA 时，会将 `vma->vm_ops` 置为 `null` ，故可以通过此字段区分匿名映射与文件映射
+
+```c
+static inline bool vma_is_anonymous(struct vm_area_struct *vma)
+{
+	return !vma->vm_ops;
+}
+```
+
+第三种缺页场景是，虚拟内存地址 address 在进程页表中的页表项 pte 不是空的，但是其背后映射的物理内存页被内核 swap out 到磁盘上了，CPU 访问的时候依然会产生缺页。pte 的 bit 0 用于表示该 pte 映射的物理内存页是否在内存中，值为 1 表示物理内存页在内存中驻留，值为 0 表示物理内存页不在内存中，可能被 swap 到磁盘上了。
+
+```c
+#define pte_present(pte)	(!!(pte_val(pte) & (PTE_VALID | PTE_PROT_NONE)))
+
+#define PTE_VALID		(_AT(pteval_t, 1) << 0)
+#define PTE_PROT_NONE		(_AT(pteval_t, 1) << 58) /* only when !PTE_VALID */
+```
+
+![memory](./images/memory170.png)
+
+下面来看另一类别，也就是缺页虚拟内存地址背后映射的物理内存页在内存中的情况 ，这里又会近一步分为两种缺页场景。
+
+在 NUMA 架构下，CPU 访问自己的本地内存节点是最快的，但访问其他内存节点就会慢很多，这就导致了 CPU 访问内存的速度不一致。回到缺页处理的场景中就是缺页虚拟内存地址背后映射的物理内存页虽然在内存中，但是它可能是进程所在 CPU 中的本地 NUMA 节点上的内存，也可能是其他 NUMA 节点上的内存。因为 CPU 对不同 NUMA 节点上的内存有访问速度上的差异，所以内核通常倾向于让 CPU 尽量访问本地 NUMA 节点上的内存。NUMA Balancing 机制就是用来解决这个问题的。
+
+通俗来讲，NUMA Balancing 主要干两件事情，一件事是让内存跟着 CPU 走，另一件事是让 CPU 跟着内存走。进程申请到的物理内存页可能在当前 CPU 的本地 NUMA 节点上，也可能在其他 NUMA 节点上。所谓让内存跟着 CPU 走的意思就是，当进程访问的物理内存页不在当前 CPU 的本地 NUMA 节点上时，NUMA Balancing 就会尝试将远程 NUMA 节点上的物理内存页迁移到本地 NUMA 节点上，加快进程访问内存的速度。所谓让 CPU 跟着内存走的意思就是，当进程经常访问的大部分物理内存页均不在当前 CPU 的本地 NUMA 节点上时，NUMA Balancing 干脆就把进程重新调度到这些物理内存页所在的 NUMA 节点上。当然整个 NUMA Balancing 的过程会根据用户设置的 NUMA policy 以及各个 NUMA 节点上缺页的次数来综合考虑是否迁移内存页。
+
+NUMA Balancing 会周期性扫描进程虚拟内存地址空间，如果发现虚拟内存背后映射的物理内存页不在当前 CPU 本地 NUMA 节点的时候，就会把对应的页表项 pte 标记为 PTE_PROT_NONE，也就是将 pte 的第 58 个 比特位置为 1，随后会将 pte 的 Present 位置为 0 。这种情况下调用 `pte_present` 依然很返回 true ，因为当前的物理内存页毕竟是在内存中的，只不过不在当前 CPU 的本地 NUMA 节点上而已。当 pte 被标记为 PTE_PROT_NONE 之后，这意味着该 pte 背后映射的物理内存页进程对其没有读写权限，也没有可执行的权限。进程在访问这段虚拟内存地址的时候就会发生缺页。当进入缺页异常的处理程序之后，内核会在 `handle_pte_fault` 函数中通过 `pte_protnone` 函数判断，缺页的 pte 是否被标记了 PTE_PROT_NONE 标识。
+
+```c
+static inline int pte_protnone(pte_t pte)
+{
+	return (pte_val(pte) & (PTE_VALID | PTE_PROT_NONE)) == PTE_PROT_NONE;
+}
+```
+
+如果 pte 被标记了 PTE_PROT_NONE，并且对应的虚拟内存区域是一个具有读写，可执行权限的 vma。这就说明该 vma 背后映射的物理内存页不在当前 CPU 的本地 NUMA 节点上。随后就需要调用 `do_numa_page`，将这个远程 NUMA 节点上的物理内存页迁移到当前 CPU 的本地 NUMA 节点上，从而加快进程访问内存的速度。
+
+```c
+static inline bool vma_is_accessible(struct vm_area_struct *vma)
+{
+	return vma->vm_flags & VM_ACCESS_FLAGS;
+}
+
+/* VMA basic access permission flags */
+#define VM_ACCESS_FLAGS (VM_READ | VM_WRITE | VM_EXEC)
+```
+
+NUMA Balancing 机制看起来非常好，但是同时也会为系统引入很多开销，比如，扫描进程地址空间的开销，缺页的开销，更主要的是页面迁移的开销会很大，这也会引起 CPU 有时候莫名其妙的飙到 100 %。因此一般情况下还是将 NUMA Balancing 关闭为好，除非有明确的理由开启。可以将内核参数 `/proc/sys/kernel/numa_balancing` 设置为 0 或者通过 sysctl 命令来关闭 NUMA Balancing。
+
+```c
+echo 0 > /proc/sys/kernel/numa_balancing
+
+sysctl -w kernel.numa_balancing=0
+```
+
+第二种场景就是写时复制了（Copy On Write， COW），这种场景和 NUMA Balancing 一样，都属于缺页虚拟内存地址背后映射的物理内存页在内存中而引起的缺页中断。
+
+COW 在内核的内存管理子系统中很常见了，比如，父进程通过 fork 系统调用创建子进程之后，父子进程的虚拟内存空间完全是一模一样的，包括父子进程的页表内容都是一样的，父子进程页表中的 PTE 均指向同一物理内存页面，此时内核会将父子进程页表中的 PTE 均改为只读的，并将父子进程共同映射的这个物理页面引用计数 + 1。当父进程或者子进程对该页面发生写操作的时候，现在假设子进程先对页面发生写操作，随后子进程发现自己页表中的 PTE 是只读的，于是产生缺页中断，子进程进入内核态，内核会在本小节介绍的缺页中断处理程序中发现，访问的这个物理页面引用计数大于 1，说明此时该物理内存页面存在多进程共享的情况，于是发生写时复制（Copy On Write， COW），内核为子进程重新分配一个新的物理页面，然后将原来物理页中的内容拷贝到新的页面中，最后子进程页表中的 PTE 指向新的物理页面并将 PTE 的 R/W 位设置为 1，原来物理页面的引用计数 - 1。后面父进程在对页面进行写操作的时候，同样也会发现父进程的页表中 PTE 是只读的，也会产生缺页中断，但是在内核的缺页中断处理程序中，发现访问的这个物理页面引用计数为 1 了，那么就只需要将父进程页表中的 PTE 的 R/W 位设置为 1 就可以了。
+
+私有文件映射，也用到了 COW，当多个进程采用私有文件映射的方式对同一文件的同一部分进行映射的时候，后续产生的 pte 也都是只读的。当任意进程开始对它的私有文件映射区进行写操作时，就会发生写时复制，随后内核会在这里介绍的缺页中断程序中重新申请一个内存页，然后将 page cache 中的内容拷贝到这个新的内存页中，进程页表中对应的 pte 会重新关联到这个新的内存页上，此时 pte 的权限变为可写。
+
+**在以上介绍的两种写时复制应用场景中，他们都有一个共同的特点，就是进程的虚拟内存区域 vma 的权限是可写的，但是其对应在页表中的 pte 却是只读的，而 pte 映射的物理内存页也在内存中**。
+
+![memory](./images/memory171.png)
+
+```c
+static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+{
+    pte_t entry;
+
+    if (unlikely(pmd_none(*vmf->pmd))) {
+        // 如果 pmd 是空的，说明现在连页表都没有，页表项 pte 自然是空的
+        vmf->pte = NULL;
+    } else {
+        /* vmf->pte 表示缺页虚拟内存地址在页表中对应的页表项 pte
+         * 通过 pte_offset_map 定位到虚拟内存地址 address 对应在页表中的 pte
+         * 这里根据 address 获取 pte_index，然后从 pmd 中提取页表起始虚拟内存地址相加获取 pte
+         */
+        vmf->pte = pte_offset_map(vmf->pmd, vmf->address);
+        // vmf->orig_pte 表示发生缺页时，address 对应的 pte 值
+        vmf->orig_pte = *vmf->pte;
+
+        // 这里 pmd 不是空的，表示现在是有页表存在的，但缺页虚拟内存地址在页表中的 pte 是空值
+        if (pte_none(vmf->orig_pte)) {
+            pte_unmap(vmf->pte);
+            vmf->pte = NULL;
+        }
+    }
+
+    // pte 是空的，表示缺页地址 address 还从来没有被映射过，接下来就要处理物理内存的映射
+    if (!vmf->pte) {
+        // 判断缺页的虚拟内存地址 address 所在的虚拟内存区域 vma 是否是匿名映射区
+        if (vma_is_anonymous(vmf->vma))
+            // 处理匿名映射区发生的缺页
+            return do_anonymous_page(vmf);
+        else
+            // 处理文件映射区发生的缺页
+            return do_fault(vmf);
+    }
+
+    // 走到这里表示 pte 不是空的，但是 pte 中的 p 比特位是 0 值，表示之前映射的物理内存页已不在内存中（swap out）
+    if (!pte_present(vmf->orig_pte))
+        // 将之前映射的物理内存页从磁盘中重新 swap in 到内存中
+        return do_swap_page(vmf);
+
+    /* 这里表示 pte 背后映射的物理内存页在内存中，但是 NUMA Balancing 发现该内存页不在当前进程运行的 numa 节点上
+     * 所以将该 pte 标记为 PTE_PROT_NONE（无读写，可执行权限）
+     * 进程访问该内存页时发生缺页中断，在这里的 do_numa_page 中，内核将该 page 迁移到进程运行的 numa 节点上。
+     */
+    if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
+        return do_numa_page(vmf);
+
+    entry = vmf->orig_pte;
+    // 如果本次缺页中断是由写操作引起的
+    if (vmf->flags & FAULT_FLAG_WRITE) {
+        // 这里说明 vma 是可写的，但是 pte 被标记为不可写，说明是写保护类型的中断
+        if (!pte_write(entry))
+            // 进行写时复制处理，cow 就发生在这里
+            return do_wp_page(vmf);
+        // 如果 pte 是可写的，就将 pte 标记为脏页
+        entry = pte_mkdirty(entry);
+    }
+    // 将 pte 的 access 比特位置 1 ，表示该 page 是活跃的。避免被 swap 出去
+    entry = pte_mkyoung(entry);
+
+    /* 经过上面的缺页处理，这里会判断原来的页表项 entry（orig_pte） 值是否发生了变化
+     * 如果发生了变化，就把 entry 更新到 vmf->pte 中。
+     */
+    if (ptep_set_access_flags(vmf->vma, vmf->address, vmf->pte, entry,
+                vmf->flags & FAULT_FLAG_WRITE)) {
+        // pte 既然变化了，则刷新 mmu （体系结构相关）
+        update_mmu_cache(vmf->vma, vmf->address, vmf->pte);
+    } else {
+        /* 如果 pte 内容本身没有变化，则不需要刷新任何东西
+         * 但是有个特殊情况就是写保护类型中断，产生的写时复制，产生了新的映射关系，需要刷新一下 tlb
+		 */
+		/*
+		 * This is needed only for protection faults but the arch code
+		 * is not yet telling us if this is a protection fault or not.
+		 * This still avoids useless tlb flushes for .text page faults
+		 * with threads.
+		 */
+        if (vmf->flags & FAULT_FLAG_WRITE)
+            flush_tlb_fix_spurious_fault(vmf->vma, vmf->address);
+    }
+
+    return 0;
+}
+```
+
+最后一级页表需要调用 `pte_alloc` 继续把页表补齐了。首先通过 `pmd_none` 判断缺页地址 address 在进程页表中间页目录 PMD 中对应的页目录项 pmd 是否是空的，如果 pmd 是空的，说明此时还不存在一级页表，这样一来，就需要调用 `__pte_alloc` 来分配一张页表，然后用 pte 的物理地址和初始权限位 PMD_TYPE_TABLE 来填充 pmd。
+
+```c
+#define pte_alloc(mm, pmd) (unlikely(pmd_none(*(pmd))) && __pte_alloc(mm, pmd))
+
+int __pte_alloc(struct mm_struct *mm, pmd_t *pmd)
+{
+    spinlock_t *ptl;
+    // 调用 get_zeroed_page 申请一个 4k 物理内存页并初始化为 0 值作为新的页表，new 指向新分配的 页表 起始内存地址
+    pgtable_t new = pte_alloc_one(mm);
+    if (!new)
+        return -ENOMEM;
+    // 锁定中间页目录项 pmd
+    ptl = pmd_lock(mm, pmd);
+    // 如果 pmd 是空的，说明此时 pmd 并未指向页表，下面就需要用新页表 new 来填充 pmd 
+    if (likely(pmd_none(*pmd))) {  
+        /* 更新 mm->pgtables_bytes 计数，该字段用于统计进程页表所占用的字节数
+         * 由于这里新增了一张页表，所以计数需要增加 PTRS_PER_PTE * sizeof(pte_t)
+         */
+        mm_inc_nr_ptes(mm);
+        // 将 new 指向的新分配出来的页表 page 的 pfn 以及相关初始权限位填充到 pmd 中
+        pmd_populate(mm, pmd, new);
+        new = NULL;
+    }
+    spin_unlock(ptl);
+    return 0;
+}
+
+// 页表可以容纳的页表项 pte_t 的个数
+#define PTRS_PER_PTE  512
+
+static inline void
+pmd_populate(struct mm_struct *mm, pmd_t *pmdp, pgtable_t ptep)
+{
+	__pmd_populate(pmdp, page_to_phys(ptep), PMD_TYPE_TABLE);
+}
+
+static inline void __pmd_populate(pmd_t *pmdp, phys_addr_t ptep,
+				  pmdval_t prot)
+{
+	set_pmd(pmdp, __pmd(__phys_to_pmd_val(ptep) | prot));
+}
+```
+
+#### 匿名页缺页
+
+![memory](./images/memory172.png)
+
+```c
+#define mk_pte(page, pgprot)   pfn_pte(page_to_pfn(page), (pgprot))
+
+static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+{
+    // 缺页地址 address 所在的虚拟内存区域 vma
+    struct vm_area_struct *vma = vmf->vma;
+    // 指向分配的物理内存页，后面与虚拟内存进行映射
+    struct page *page;
+    vm_fault_t ret = 0;
+    // 临时的 pte 用于构建 pte 中的值，后续会赋值给 address 在页表中对应的真正 pte
+    pte_t entry;
+
+    // 如果 pmd 是空的，表示现在还没有一级页表。pte_alloc 这里会创建一级页表，并填充 pmd 中的内容 
+    if (pte_alloc(vma->vm_mm, vmf->pmd))
+        return VM_FAULT_OOM;
+  
+    // 页表创建好之后，这里从伙伴系统中分配一个 4K 物理内存页出来
+    page = alloc_zeroed_user_highpage_movable(vma, vmf->address);
+    if (!page)
+        goto oom;
+    // 将 page 的 pfn 以及相关权限标记位 vm_page_prot 初始化一个临时 pte 出来 
+    entry = mk_pte(page, vma->vm_page_prot);
+    // 如果 vma 是可写的，则将 pte 标记为可写，脏页。
+    if (vma->vm_flags & VM_WRITE)
+        entry = pte_mkwrite(pte_mkdirty(entry));
+    // 锁定一级页表，并获取 address 在页表中对应的真实 pte
+    vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
+            &vmf->ptl);
+    // 是否有其他线程在并发处理缺页
+    if (!pte_none(*vmf->pte))
+        goto release;
+    // 增加 进程 rss 相关计数，匿名内存页计数 + 1
+    inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
+    // 建立匿名页反向映射关系
+    page_add_new_anon_rmap(page, vma, vmf->address, false);
+    // 将匿名页添加到 LRU 链表中
+    lru_cache_add_active_or_unevictable(page, vma);
+setpte:
+    // 将 entry 赋值给真正的 pte，这里 pte 就算被填充好了，进程页表体系也就补齐了
+    set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+    // 刷新 mmu 
+    update_mmu_cache(vma, vmf->address, vmf->pte);
+unlock:
+    // 解除 pte 的映射
+    pte_unmap_unlock(vmf->pte, vmf->ptl);
+    return ret;
+release:
+    // 释放 page 
+    put_page(page);
+    goto unlock;
+oom:
+    return VM_FAULT_OOM;
+}
+```
+
+#### 文件页缺页
+
+`vma->vm_ops->fault` 函数就是专门用于处理文件映射区缺页的。mmap 进行文件映射的时候只是单纯地建立了虚拟内存与文件之间的映射关系，此时并没有物理内存分配。当进程对这段文件映射区进行读取操作的时候，会触发缺页，然后分配物理内存（文件页），这一部分逻辑在下面的 `do_read_fault` 函数中完成，它主要处理的是由于对文件映射区的读取操作而引起的缺页情况。mmap 文件映射又分为私有文件映射与共享文件映射两种映射方式，而私有文件映射的核心特点是读共享的，当任意进程对私有文件映射区发生写入操作时候，就会发生写时复制 COW，这一部分逻辑在下面的 `do_cow_fault` 函数中完成。对共享文件映射区进行的写入操作而引起的缺页，内核放在 `do_shared_fault` 函数中进行处理。
+
+```c
+static vm_fault_t do_fault(struct vm_fault *vmf)
+{
+    struct vm_area_struct *vma = vmf->vma;
+    struct mm_struct *vm_mm = vma->vm_mm;
+    vm_fault_t ret;
+
+    // 处理 vm_ops->fault 为 null 的异常情况
+    if (!vma->vm_ops->fault) {
+        // 如果中间页目录 pmd 指向的一级页表不在内存中，则返回 SIGBUS 错误
+        if (unlikely(!pmd_present(*vmf->pmd)))
+            ret = VM_FAULT_SIGBUS;
+        else {
+            // 获取缺页的页表项 pte
+            vmf->pte = pte_offset_map_lock(vmf->vma->vm_mm,
+                               vmf->pmd,
+                               vmf->address,
+                               &vmf->ptl);
+            // pte 为空，则返回 SIGBUS 错误
+            if (unlikely(pte_none(*vmf->pte)))
+                ret = VM_FAULT_SIGBUS;
+            else
+                // pte 不为空，返回 NOPAGE，即本次缺页处理不会分配物理内存页
+                ret = VM_FAULT_NOPAGE;
+
+            pte_unmap_unlock(vmf->pte, vmf->ptl);
+        }
+    } else if (!(vmf->flags & FAULT_FLAG_WRITE))
+        // 缺页如果是读操作引起的，进入 do_read_fault 处理
+        ret = do_read_fault(vmf);
+    else if (!(vma->vm_flags & VM_SHARED))
+        // 缺页是由私有映射区的写入操作引起的，则进入 do_cow_fault 处理写时复制
+        ret = do_cow_fault(vmf);
+    else
+        // 处理共享映射区的写入缺页
+        ret = do_shared_fault(vmf);
+
+    return ret;
+}
+```
+
+当任意进程开始访问其地址空间中的这段虚拟内存区域 vma 时，由于背后没有对应文件页进行映射，所以会发生缺页中断，在缺页中断中内核会首先分配一个物理内存页并加入到 page cache 中，随后将映射的文件内容读取到刚刚创建出来的物理内存页中，然后将这个物理内存页映射到缺页虚拟内存地址 address 对应在进程页表中的 pte 中。
+
+内核还会考虑到进程访问内存的空间局部性，除了会映射本次缺页需要的文件页之外，还会将其相邻的文件页读取到 page cache 中，然后将这些相邻的文件页映射到对应的 pte 中。这一部分预先提前映射的逻辑在 `map_pages` 函数中实现。如果不满足预先提前映射的条件，那么内核就只会专注处理映射本次缺页所需要的文件页。
+
+对于私有文件映射，`do_read_fault` 函数处理就完成后，这个 pte 还是只读的，多进程之间读共享，当任意进程尝试写入的时候，会发生写时复制。
+
+```c
+static const struct vm_operations_struct ext4_file_vm_ops = {
+    .fault      = ext4_filemap_fault,
+    .map_pages  = filemap_map_pages,
+    .page_mkwrite   = ext4_page_mkwrite,
+};
+
+static unsigned long fault_around_bytes __read_mostly =
+	rounddown_pow_of_two(65536);
+
+static vm_fault_t do_read_fault(struct vm_fault *vmf)
+{
+    struct vm_area_struct *vma = vmf->vma;
+    vm_fault_t ret = 0;
+
+    /* map_pages 用于提前预先映射文件页相邻的若干文件页到相关 pte 中，从而减少缺页次数
+     * fault_around_bytes 控制预先映射的的字节数默认初始值为 65536（16个物理内存页）
+     */
+    if (vma->vm_ops->map_pages && fault_around_bytes >> PAGE_SHIFT > 1) {
+        /* 这里会尝试使用 map_pages 将缺页地址 address 附近的文件页预读进 page cache
+         * 然后填充相关的 pte，目的是减少缺页次数
+         */
+        ret = do_fault_around(vmf);
+        if (ret)
+            return ret;
+    }
+
+    /* 如果不满足预先映射的条件，则只映射本次需要的文件页
+     * 首先会从 page cache 中读取文件页，如果 page cache 中不存在则从磁盘中读取，并预读若干文件页到 page cache 中
+     */
+    ret = __do_fault(vmf);     // 这里需要负责获取文件页，并不映射
+    // 将本次缺页所需要的文件页映射到 pte 中。
+    ret |= finish_fault(vmf);
+    unlock_page(vmf->page);
+    return ret;
+}
+
+static vm_fault_t do_cow_fault(struct vm_fault *vmf)
+{
+    struct vm_area_struct *vma = vmf->vma;
+    vm_fault_t ret;
+    // 从伙伴系统重新申请一个用于写时复制的物理内存页 cow_page
+    vmf->cow_page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma, vmf->address);
+    // 从 page cache 读取原来的文件页
+    ret = __do_fault(vmf);
+    // 将原来文件页中的内容拷贝到 cow_page 中完成写时复制
+    copy_user_highpage(vmf->cow_page, vmf->page, vmf->address, vma);
+    // 将 cow_page 重新映射到缺页地址 address 对应在页表中的 pte 上。
+    ret |= finish_fault(vmf);
+    unlock_page(vmf->page);
+    // 原来的文件页引用计数 - 1
+    put_page(vmf->page);
+    return ret;
+}
+
+/* 进程的这段虚拟文件映射区就映射到了专属的物理内存页 cow_page 上，而且内容和原来文件页 page 中的内容一模一样，
+ * 进程对各自虚拟内存区的修改只能反应到各自对应的 cow_page上，而且各自的修改在进程之间是互不可见的。
+ * 由于 cow_page 已经脱离了 page cache，所以这些修改也都不会回写到磁盘文件中，这就是私有文件映射的核心特点。 
+ */
+
+static vm_fault_t do_shared_fault(struct vm_fault *vmf)
+{
+    struct vm_area_struct *vma = vmf->vma;
+    vm_fault_t ret, tmp;
+    // 从 page cache 中读取文件页
+    ret = __do_fault(vmf);
+   
+    if (vma->vm_ops->page_mkwrite) {
+        unlock_page(vmf->page);
+        // 将文件页变为可写状态，并为后续记录文件日志做一些准备工作
+        tmp = do_page_mkwrite(vmf);
+    }
+
+    // 将文件页映射到缺页 address 在页表中对应的 pte 上
+    ret |= finish_fault(vmf);
+
+    // 将 page 标记为脏页，记录相关文件系统的日志，防止数据丢失。判断是否将脏页回写
+    fault_dirty_shared_page(vma, vmf->page);
+    return ret;
+}
+
+static vm_fault_t __do_fault(struct vm_fault *vmf)
+{
+    struct vm_area_struct *vma = vmf->vma;
+    vm_fault_t ret;
+    // ......
+    ret = vma->vm_ops->fault(vmf);
+    // ......
+    return ret;
+}
+
+vm_fault_t ext4_filemap_fault(struct vm_fault *vmf)
+{
+    ret = filemap_fault(vmf);
+    return ret;
+}
+
+static const struct address_space_operations ext4_aops = {
+    .readpage       = ext4_readpage
+}
+
+vm_fault_t filemap_fault(struct vm_fault *vmf)
+{
+    int error;
+    // 获取映射文件
+    struct file *file = vmf->vma->vm_file;
+    // 获取 page cache
+    struct address_space *mapping = file->f_mapping;    
+    // 获取映射文件的 inode
+    struct inode *inode = mapping->host;
+    // 获取映射文件内容在文件中的偏移
+    pgoff_t offset = vmf->pgoff;
+    // 从 page cache 读取到的文件页，存放在 vmf->page 中返回
+    struct page *page;
+    vm_fault_t ret = 0;
+
+    // 根据文件偏移 offset，到 page cache 中查找对应的文件页
+    page = find_get_page(mapping, offset);
+    if (likely(page) && !(vmf->flags & FAULT_FLAG_TRIED)) {
+        // 如果文件页在 page cache 中，则启动异步预读，预读后面的若干文件页到 page cache 中
+        fpin = do_async_mmap_readahead(vmf, page);
+    } else if (!page) {
+        /* 如果文件页不在 page cache，那么就需要启动 io 从文件中读取内容到 page cahe
+         * 由于涉及到了磁盘 io ，所以本次缺页类型为 VM_FAULT_MAJOR
+         */
+        count_vm_event(PGMAJFAULT);
+        count_memcg_event_mm(vmf->vma->vm_mm, PGMAJFAULT);
+        ret = VM_FAULT_MAJOR;
+        /* 启动同步预读，通过 address_space_operations 中定义的 readpage 激活块设备驱动从磁盘中读取映射的文件内容
+         * 将所需的文件数据读取进 page cache 中并同步预读若干相邻的文件数据到 page cache 
+         */
+        fpin = do_sync_mmap_readahead(vmf);
+retry_find:
+        // 尝试到 page cache 中重新读取文件页，这一次就可以读到了
+        page = pagecache_get_page(mapping, offset,
+                      FGP_CREAT|FGP_FOR_MMAP,
+                      vmf->gfp_mask);
+        }
+    }
+
+    // ......
+	vmf->page = page;
+	// ......
+}
+EXPORT_SYMBOL(filemap_fault);
+
+vm_fault_t finish_fault(struct vm_fault *vmf)
+{
+    // 为本次缺页准备好的物理内存页，即后续需要用 pte 映射的内存页
+    struct page *page;
+    vm_fault_t ret = 0;
+
+    if ((vmf->flags & FAULT_FLAG_WRITE) &&
+        !(vmf->vma->vm_flags & VM_SHARED))
+        // 如果是写时复制场景，那么 pte 要映射的是这个 cow 复制过来的内存页
+        page = vmf->cow_page;
+    else
+        // 在 filemap_fault 函数中读取到的文件页，后面需要将文件页映射到 pte 中
+        page = vmf->page;
+
+    /* 对于私有映射来说，这里需要检查进程地址空间是否被标记了 MMF_UNSTABLE
+     * 如果是，那么 oom 后续会回收这块地址空间，这会导致私有映射的文件页丢失
+     * 所以在为私有映射建立 pte 映射之前，需要检查一下
+     */
+    if (!(vmf->vma->vm_flags & VM_SHARED))
+        // 地址空间没有被标记 MMF_UNSTABLE 则会返回 o
+        ret = check_stable_address_space(vmf->vma->vm_mm);
+    if (!ret)
+        // 将创建出来的物理内存页映射到 address 对应在页表中的 pte 中
+        ret = alloc_set_pte(vmf, vmf->memcg, page);
+    if (vmf->pte)
+        // 释放页表锁
+        pte_unmap_unlock(vmf->pte, vmf->ptl);
+    return ret;
+}
+
+vm_fault_t alloc_set_pte(struct vm_fault *vmf, struct mem_cgroup *memcg,
+        struct page *page)
+{
+    struct vm_area_struct *vma = vmf->vma;
+    // 判断本次缺页是否是写时复制
+    bool write = vmf->flags & FAULT_FLAG_WRITE;
+    pte_t entry;
+    vm_fault_t ret;
+    // 如果页表还不存在，需要先创建一个页表出来
+    if (!vmf->pte) {
+        /* 如果 pmd 为空，则创建一个页表出来，并填充 pmd
+         * 如果页表存在，则获取 address 在页表中对应的 pte 保存在 vmf->pte 中
+         */
+        ret = pte_alloc_one_map(vmf);
+        if (ret)
+            return ret;
+    }
+    /* 根据之前分配出来的内存页 pfn 以及相关页属性 vma->vm_page_prot 构造一个 pte 出来
+     * 对于私有文件映射来说，这里的 pte 是只读的
+     */
+    entry = mk_pte(page, vma->vm_page_prot);
+    // 如果是写时复制，这里才会将 pte 改为可写的
+    if (write) 
+        entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+    /* 将构造出来的 pte （entry）赋值给 address 在页表中真正对应的 vmf->pte
+     * 现在进程页表体系就全部被构建出来了，文件页缺页处理到此结束
+     */
+    set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+    // 刷新 mmu
+    update_mmu_cache(vma, vmf->address, vmf->pte);
+
+    return 0;
+}
+```
+
+#### 写时复制
+
+`do_wp_page` 函数和 `do_cow_fault` 函数都是用于处理写时复制的，其最为核心的逻辑都是差不多的，只是在触发场景上会略有不同。
+
+- `do_cow_fault` 函数主要处理的写时复制场景是，mmap 进行私有文件映射完之后，此时进程的页表或者相关页表项 pte 还是空的，就立即进行写入操作。
+
+- `do_wp_page` 函数主要处理的写时复制场景是，访问的这块虚拟内存背后是有物理内存页映射的，对应的 pte 不为空，只不过相关 pte 的权限是只读的，而虚拟内存区域 vma 是有写权限的，在这种类型的虚拟内存进行写入操作的时候，触发的写时复制就在 `do_wp_page` 函数中处理。
+
+  - 比如，使用 mmap 进行私有文件映射之后，此时只是分配了虚拟内存，进程页表或者相关 pte 还是空的，这时对这块映射的虚拟内存进行访问的时候就会触发缺页中断，最后在 `do_read_fault` 函数中将映射的文件内容加载到 page cache 中，pte 指向 page cache 中的文件页。但此时的 pte 是只读的，如果我们对这块映射的虚拟内存进行写入操作，就会发生写时复制，由于现在 pte 不为空，背后也映射着文件页，所以会在 `do_wp_page` 函数中进行处理。
+
+  - 除了私有映射的文件页之外，`do_wp_page` 还会对匿名页相关的写时复制进行处理。比如，通过 fork 系统调用创建子进程的时候，内核会拷贝父进程占用的所有资源到子进程中，其中也包括了父进程的地址空间以及父进程的页表。一个进程中申请的物理内存页既会有文件页也会有匿名页，而这些文件页和匿名页既可以是私有的也可以是共享的，当内核在拷贝父进程的页表时，如果遇到私有的匿名页或者文件页，就会将其对应在父子进程页表中的 pte 设置为只读，进行写保护。并将父子进程共同引用的匿名页或者文件页的引用计数加 1。现在父子进程拥有了一模一样的地址空间，页表是一样的，页表中的 pte 均指向同一个物理内存页面，对于私有的物理内存页来说，父子进程的相关 pte 此时均变为了只读的，私有物理内存页的引用计数为 2 。而对于共享的物理内存页来说，内核就只是简单的将父进程的 pte 拷贝到子进程页表中即可，然后将子进程 pte 中的脏页标记清除，其他的不做改变。当父进程或者子进程对该页面发生写操作的时候，假设子进程先对页面发生写操作，随后子进程发现自己页表中的 pte 是只读的，于是就会产生写保护类型的缺页中断，由于子进程页表中的 pte 不为空，所以会进入到 `do_wp_page` 函数中处理。
+
+```c
+static vm_fault_t do_wp_page(struct vm_fault *vmf)
+    __releases(vmf->ptl)
+{
+    struct vm_area_struct *vma = vmf->vma;
+    // 获取 pte 映射的物理内存页
+    vmf->page = vm_normal_page(vma, vmf->address, vmf->orig_pte);
+
+    // ...... 省略处理特殊映射相关逻辑 ....
+    // 物理内存页为匿名页的情况
+    if (PageAnon(vmf->page)) {
+
+        // ...... 省略处理 ksm page 相关逻辑 ....
+        // reuse_swap_page 判断匿名页的引用计数是否为 1
+        if (reuse_swap_page(vmf->page, &total_map_swapcount)) {
+            /* 如果当前物理内存页的引用计数为 1 ，并且只有当前进程在引用该物理内存页
+             * 则不做写时复制处理，而是复用当前物理内存页，只是将 pte 改为可写即可 
+             */
+            wp_page_reuse(vmf);
+            return VM_FAULT_WRITE;
+        }
+        unlock_page(vmf->page);
+    } else if (unlikely((vma->vm_flags & (VM_WRITE|VM_SHARED)) ==
+                    (VM_WRITE|VM_SHARED))) {
+        /* 处理共享可写的内存页，由于大家都可写，所以这里也只是调用 wp_page_reuse 复用当前内存页即可，不做写时复制处理
+         * 由于是共享的，对于文件页来说是可以回写到磁盘上的，
+         * 所以会额外调用一次 fault_dirty_shared_page 判断是否进行脏页的回写
+         */
+        return wp_page_shared(vmf);
+    }
+copy:
+    /* 走到这里表示当前物理内存页的引用计数大于 1 被多个进程引用
+     * 对于私有可写的虚拟内存区域来说，就要发生写时复制
+     * 而对于私有文件页的情况来说，不必判断内存页的引用计数
+     * 因为是私有文件页，不管文件页的引用计数是不是 1 ，都要进行写时复制
+     */
+    return wp_page_copy(vmf);
+}
+
+static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+{
+    // 缺页地址 address 所在 vma
+    struct vm_area_struct *vma = vmf->vma;
+    // 当前进程地址空间
+    struct mm_struct *mm = vma->vm_mm;
+    // 原来映射的物理内存页，pte 为只读
+    struct page *old_page = vmf->page;
+    // 用于写时复制的新内存页
+    struct page *new_page = NULL;
+    // 写时复制之后，需要修改原来的 pte，这里是临时构造的一个 pte 值
+    pte_t entry;
+    // 是否发生写时复制
+    int page_copied = 0;
+
+    // 如果 pte 原来映射的是一个零页
+    if (is_zero_pfn(pte_pfn(vmf->orig_pte))) {
+        // 新申请一个零页出来，内存页中的内容被零初始化
+        new_page = alloc_zeroed_user_highpage_movable(vma,
+                                  vmf->address);
+        if (!new_page)
+            goto oom;
+    } else {
+        // 新申请一个物理内存页
+        new_page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma,
+                vmf->address);
+        if (!new_page)
+            goto oom;
+        // 将原来内存页 old page 中的内容拷贝到新内存页 new page 中
+        cow_user_page(new_page, old_page, vmf->address, vma);
+    }
+
+    // 给页表加锁，并重新获取 address 在页表中对应的 pte
+    vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
+    // 判断加锁前的 pte （orig_pte）与加锁后的 pte （vmf->pte）是否相同，目的是判断此时是否有其他线程正在并发修改 pte 
+    if (likely(pte_same(*vmf->pte, vmf->orig_pte))) {
+        if (old_page) {
+            // 更新进程常驻内存信息 rss_state
+            if (!PageAnon(old_page)) {
+                // 减少 MM_FILEPAGES 计数
+                dec_mm_counter_fast(mm,
+                        mm_counter_file(old_page));
+                // 由于发生写时复制，这里匿名页个数加 1 
+                inc_mm_counter_fast(mm, MM_ANONPAGES);
+            }
+        } else {
+            inc_mm_counter_fast(mm, MM_ANONPAGES);
+        }
+        // 将旧的 tlb 缓存刷出
+        flush_cache_page(vma, vmf->address, pte_pfn(vmf->orig_pte));
+        // 创建一个临时的 pte 映射到新内存页 new page 上
+        entry = mk_pte(new_page, vma->vm_page_prot);
+        // 设置 entry 为可写的，正是这里, pte 的权限由只读变为了可写
+        entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+        // 为新的内存页建立反向映射关系
+        page_add_new_anon_rmap(new_page, vma, vmf->address, false);
+        // 将新的内存页加入到 LRU active 链表中
+        lru_cache_add_active_or_unevictable(new_page, vma);
+        // 将 entry 值重新设置到子进程页表 pte 中
+        set_pte_at_notify(mm, vmf->address, vmf->pte, entry);
+        // 更新 mmu
+        update_mmu_cache(vma, vmf->address, vmf->pte);
+        if (old_page) {
+            // 将原来的内存页从当前进程的反向映射关系中解除
+            page_remove_rmap(old_page, false);
+        }
+
+        /* Free the old page.. */
+        new_page = old_page;
+        page_copied = 1;
+    } else {
+        mem_cgroup_cancel_charge(new_page, memcg, false);
+    }
+    // 释放页表锁
+    pte_unmap_unlock(vmf->pte, vmf->ptl);
+
+    if (old_page) {
+        // 旧内存页的引用计数减 1
+        put_page(old_page);
+    }
+    return page_copied ? VM_FAULT_WRITE : 0;
+}
+
+static inline void wp_page_reuse(struct vm_fault *vmf)
+    __releases(vmf->ptl)
+{
+    struct vm_area_struct *vma = vmf->vma;
+    struct page *page = vmf->page;
+    pte_t entry;
+    // 先将 tlb cache 中缓存的 address 对应的 pte 刷出缓存
+    flush_cache_page(vma, vmf->address, pte_pfn(vmf->orig_pte));
+    // 将原来 pte 的 access 位置 1 ，表示该 pte 映射的物理内存页是活跃的
+    entry = pte_mkyoung(vmf->orig_pte);
+    // 将原来只读的 pte 改为可写的，并标记为脏页
+    entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+    // 将更新后的 entry 值设置到页表 pte 中
+    if (ptep_set_access_flags(vma, vmf->address, vmf->pte, entry, 1))
+        // 更新 mmu 
+        update_mmu_cache(vma, vmf->address, vmf->pte);
+    pte_unmap_unlock(vmf->pte, vmf->ptl);
+}
+```
+
+#### swap 缺页
+
+如果在遍历进程页表的时候发现，虚拟内存地址 address 对应的页表项 pte 不为空，但是 pte 中第 0 个比特位置为 0 ，则表示该 pte 之前是被物理内存映射过的，只不过后来被内核 swap out 出去了。当物理内存页不在内存中反而在磁盘中，就需要将物理内存页从磁盘中 swap in 进来。但在 swap in 之前内核需要知道该物理内存页的内容被保存在磁盘的什么位置上。内核会将物理内存页在磁盘上的位置保存在 pte 中。为了区别 swap 的场景，使用了一个新的结构体 `swp_entry_t` 来包装。
+
+```c
+typedef struct {
+	unsigned long val;
+} swp_entry_t;
+```
+
+swap in 的首要任务就是先要从进程页表中将这个 `swp_entry_t` 读取出来，然后从 `swp_entry_t` 中解析出内存页在 swap 交换区中的位置，根据磁盘位置信息将内存页的内容读取到内存中。由于产生了新的物理内存页，所以就要创建新的 pte 来映射这个物理内存页，然后将新的 pte 设置到页表中，替换原来的 `swp_entry_t`。
+
+![memory](./images/memory173.png)
+
+swap 交换区共有两种类型，一种是 swap 分区（swap partition），另一种是 swap 文件（swap file）。
+
+- swap partition 可以认为是一个没有文件系统的裸磁盘分区，分区中的磁盘块在磁盘中是连续分布的。
+- swap file 可以认为是在某个现有的文件系统上，创建的一个定长的普通文件，专门用于保存匿名页被 swap 出来的内容。背后的磁盘块是不连续的。
+
+Linux 系统中可以允许多个这样的 swap 交换区存在，用户可以同时使用多个交换区，也可以为这些交换区指定优先级，优先级高的会被内核优先使用。这些交换区都可以被灵活地添加，删除，而不需要重启系统。多个交换区可以分散在不同的磁盘设备上，这样可以实现硬件的并行访问。在使用交换区之前，可以通过 `mkswap` 首先创建一个交换区出来，如果创建的是 swap partition，则在 `mkswap` 命令后面直接指定分区的设备文件名称即可。
+
+```c
+mkswap /dev/sdb7
+```
+
+如果创建的是 swap file，则需要额外先使用 `dd` 命令在现有文件系统中创建出一个定长的文件出来。比如下面通过 `dd` 命令从 `/dev/zero` 中拷贝创建一个 `/swapfile` 文件，大小为 4G。
+
+```c
+dd if=/dev/zero of=/swapfile bs=1M count=4096
+```
+
+然后使用 `mkswap` 命令创建 swap file ：
+
+```c
+mkswap /swapfile
+```
+
+当 swap partition 或者 swap file 创建好之后，通过 `swapon` 命令来初始化并激活这个交换区。
+
+```c
+swapon /swapfile
+```
+
+当前系统中各个交换区的情况，可以通过 `cat /proc/swaps` 或者 `swapon -s` 命令产看：
+
+![memory](./images/memory174.png)
+
+交换区在内核中使用 `struct swap_info_struct` 结构体来表示，系统中众多的交换区被组织在一个叫做 `swap_info` 的数组中，数组中的最大长度为 `MAX_SWAPFILES`，`MAX_SWAPFILES` 在内核中是一个常量，一般指定为 32，也就是说，系统中最大允许 32 个交换区存在。
+
+```c
+struct swap_info_struct *swap_info[MAX_SWAPFILES];
+```
+
+由于交换区是有优先级的，所以内核又会按照优先级高低，将交换区组织在一个叫做 `swap_avail_heads` 的双向链表中。
+
+```c
+static struct plist_head *swap_avail_heads;
+```
+
+`swap_info_struct` 结构用于描述单个交换区中的各种信息：
+
+```c
+/*
+ * The in-memory structure used to track swap areas.
+ */
+struct swap_info_struct {
+    // 用于表示该交换区的状态，比如 SWP_USED 表示正在使用状态，SWP_WRITEOK 表示交换区是可写的状态
+    unsigned long   flags;      /* SWP_USED etc: see above */
+    // 交换区的优先级
+    signed short    prio;       /* swap priority of this type */
+    // 指向该交换区在 swap_avail_heads 链表中的位置
+    struct plist_node list;     /* entry in swap_active_head */
+    // 该交换区在 swap_info 数组中的索引
+    signed char type;       /* strange name for an index */
+    // 该交换区可以容纳 swap 的匿名页总数
+    unsigned int pages;     /* total of usable pages of swap */
+    // 已经 swap 到该交换区的匿名页总数
+    unsigned int inuse_pages;   /* number of those currently in use */
+    /* 如果该交换区是 swap partition 则指向该磁盘分区的块设备结构 block_device
+     * 如果该交换区是 swap file 则指向文件底层依赖的块设备结构 block_device
+     */
+    struct block_device *bdev;  /* swap device or bdev of swap file */
+    // 指向 swap file 的 file 结构
+    struct file *swap_file;     /* seldom referenced */
+};
+```
+
+而在每个交换区 swap area 内部又会分为很多连续的 slot (槽)，每个 slot 的大小刚好和一个物理内存页的大小相同都是 4K，物理内存页在被 swap out 到交换区时，就会存放在 slot 中。交换区中的这些 slot 会被组织在一个叫做 `swap_map` 的数组中，数组中的索引就是 slot 在交换区中的 offset （这个位置信息很重要），数组中的值表示该 slot 总共被多少个进程同时引用。比如现在系统中一共有三个进程同时共享一个物理内存页（内存中的概念），当这个物理内存页被 swap out 到交换区上时，就变成了 slot （内存页在交换区中的概念），现在物理内存页没了，这三个共享进程就只能在各自的页表中指向这个 slot，因此该 slot 的引用计数就是 3，对应在数组 `swap_map` 中的值也是 3 。
+
+![memory](./images/memory175.png)
+
+交换区中的第一个 slot 用于存储交换区的元信息，比如交换区对应底层各个磁盘块的坏块列表。因此将其标注了红色，表示不能使用。`swap_map` 数组中的值表示的就是对应 slot 被多少个进程同时引用，值为 0 表示该 slot 是空闲的，下次 swap out 的时候首先查找的就是空闲 slot 。 查找范围就是 `lowest_bit` 到 `highest_bit` 之间的 slot。当查找到空闲 slot 之后，就会将整个物理内存页回写到这个 slot 中。
+
+```c
+struct swap_info_struct {
+	unsigned char *swap_map;	/* vmalloc'ed array of usage counts */
+	unsigned int lowest_bit;	/* index of first free in swap_map */
+	unsigned int highest_bit;	/* index of last free in swap_map */
+```
+
+但是这里会有一个问题就是交换区面向的是整个系统，而系统中会有很多进程，如果多个进程并发进行 swap 的时候，`swap_map` 数组就会面临并发操作的问题，这样一来就不得不需要一个全局锁来保护，但是这也导致了多个 CPU 只能串行访问，大大降低了并发度。优化策略是分段锁，内核会将 `swap_map` 数组中的这些 slot，按照常量 `SWAPFILE_CLUSTER` 指定的个数，256 个 slot 分为一个 cluster。
+
+```c
+#define SWAPFILE_CLUSTER	256
+```
+
+每个 cluster 中包含一把 `spinlock_t` 锁，如果 cluster 是空闲的，那么 `swap_cluster_info` 结构中的 data 指向下一个空闲的 cluster，如果 cluster 不是空闲的，那么 data 保存的是该 cluster 中已经分配的 slot 个数。
+
+```c
+struct swap_cluster_info {
+    spinlock_t lock;    /*
+                 * Protect swap_cluster_info fields
+                 * and swap_info_struct->swap_map
+                 * elements correspond to the swap
+                 * cluster
+                 */
+    unsigned int data:24;
+    unsigned int flags:8;
+};
+#define CLUSTER_FLAG_FREE 1 /* This cluster is free */
+#define CLUSTER_FLAG_NEXT_NULL 2 /* This cluster has no next cluster */
+#define CLUSTER_FLAG_HUGE 4 /* This cluster is backing a transparent huge page */
+```
+
+这样一来 `swap_map` 数组中的这些独立的 slot，就被按照以 cluster 为单位重新组织了起来，这些 cluster 被串联在 `cluster_info` 链表中。为了进一步利用 cpu cache，以及实现无锁化查找 slot，内核会给每个 cpu 分配一个 cluster —— `percpu_cluster`，cpu 直接从自己的 cluster 中查找空闲 slot，近一步提高了 swap out 的吞吐。当 cpu 自己的 `percpu_cluster` 用尽之后，内核则会调用 `swap_alloc_cluster` 函数从 `free_clusters` 中获取一个新的 cluster。
+
+```c
+struct swap_info_struct {
+    struct swap_cluster_info *cluster_info; /* cluster info. Only for SSD */
+    struct swap_cluster_list free_clusters; /* free clusters list */
+
+    struct percpu_cluster __percpu *percpu_cluster; /* per cpu's swap location */
+}
+```
+
+![memory](./images/memory176.png)
+
+可以把交换区 `swap_info_struct` 与进程的内存空间 `mm_struct` 放到一起一对比。swap out 出来的数据要保存在真实的磁盘中，而交换区中是按照 slot 为单位进行组织管理的，磁盘中是按照磁盘块来组织管理的，大小都是 4K 。交换区中的 slot 就好比于虚拟内存空间中的虚拟内存，都是虚拟的概念，物理内存页与磁盘块才是真实本质的东西。虚拟内存是连续的，但其背后映射的物理内存可能是不连续，交换区中的 slot 也都是连续的，但磁盘中磁盘块的扇区地址却不一定是连续的。页表可以将不连续的物理内存映射到连续的虚拟内存上，内核也需要一种机制，将不连续的磁盘块映射到连续的 slot 中。当使用 `swapon` 命令来初始化激活交换区时，内核会扫描交换区中各个磁盘块的扇区地址，以确定磁盘块与扇区的对应关系，然后搜集扇区地址连续的磁盘块，将这些连续的磁盘块组成一个块组，slot 就会一个一个的映射到这些块组上，块组之间的扇区地址是不连续的，但是 slot 是连续的。slot 与连续的磁盘块组的映射关系保存在 `swap_extent` 结构中：
+
+```c
+/*
+ * A swap extent maps a range of a swapfile's PAGE_SIZE pages onto a range of
+ * disk blocks.  A list of swap extents maps the entire swapfile.  (Where the
+ * term `swapfile' refers to either a blockdevice or an IS_REG file.  Apart
+ * from setup, they're handled identically.
+ *
+ * We always assume that blocks are of size PAGE_SIZE.
+ */
+struct swap_extent {
+    // 红黑树节点
+    struct rb_node rb_node;
+    // 块组内，第一个映射的 slot 编号
+    pgoff_t start_page;
+    // 映射的 slot 个数
+    pgoff_t nr_pages;
+    // 块组内第一个磁盘块
+    sector_t start_block;
+};
+```
+
+由于一个块组内的磁盘块都是连续的，slot 本来又是连续的，所以 `swap_extent` 结构中只需要保存映射到该块组内第一个 slot 的编号 `start_page`，块组内第一个磁盘块在磁盘上的块号，以及磁盘块个数就可以了。虚拟内存页类比 slot，物理内存页类比磁盘块，这里的 `swap_extent` 可以看做是虚拟内存区域 vma，进程的虚拟内存空间正是由一段一段的 vma 组成，这些 vma 被组织在一颗红黑树上。交换区也是一样，它是由一段一段的 `swap_extent` 组成，同样也会被组织在一颗红黑树上。可以通过 slot 在交换区中的 offset，在这颗红黑树中快速查找出 slot 背后对应的磁盘块。
+
+```c
+struct swap_info_struct {
+	struct rb_root swap_extent_root;/* root of the swap extent rbtree */
+}
+```
+
+![memory](./images/memory177.png)
+
+总结下来 `swp_entry_t` 中需要包含以下三种信息：
+
+1. `swp_entry_t` 需要标识该页表项是一个 pte 还是 `swp_entry_t`，因为它俩本质上是一样的，都是 `unsigned long` 类型的无符号整数，是可以相互转换的。第 0 个比特位置 1 表示是一个 pte，背后映射的物理内存页存在于内存中。如果第 0 个比特位置 0 则表示该 pte 背后映射的物理内存页已经被 swap out 出去了，那么它就是一个 `swp_entry_t`，指向内存页在交换区中的位置。
+
+   ```c
+   #define __pte_to_swp_entry(pte)	((swp_entry_t) { pte_val(pte) })
+   #define __swp_entry_to_pte(swp)	((pte_t) { (swp).val })
+   ```
+
+2. 第二，`swp_entry_t` 需要包含被 swap 出去的匿名页所在交换区的索引 type，第 2 个比特位到第 7 个比特位，总共使用 6 个比特来表示匿名页所在交换区的索引。
+
+3. 第三，`swp_entry_t` 需要包含匿名页所在 slot 的位置 offset，第 8 个比特位到第 57 个比特位，总共 50 个比特来表示匿名页对应的 slot 在交换区的 offset 。
+
+![memory](./images/memory178.png)
+
+```c
+/*
+ * Encode and decode a swap entry:
+ *	bits 0-1:	present (must be zero)
+ *	bits 2-7:	swap type
+ *	bits 8-57:	swap offset
+ *	bit  58:	PTE_PROT_NONE (must be zero)
+ */
+#define __SWP_TYPE_SHIFT	2
+#define __SWP_TYPE_BITS		6
+#define __SWP_OFFSET_BITS	50
+#define __SWP_OFFSET_SHIFT	(__SWP_TYPE_BITS + __SWP_TYPE_SHIFT)
+```
+
+内核提供了宏 `__swp_type` 用于从 `swp_entry_t` 中将匿名页所在交换区编号提取出来，还提供了宏 `__swp_offset` 用于从 `swp_entry_t` 中将匿名页所在 slot 的 offset 提取出来。
+
+```c
+#define __swp_type(x)		(((x).val >> __SWP_TYPE_SHIFT) & __SWP_TYPE_MASK)
+#define __swp_offset(x)		(((x).val >> __SWP_OFFSET_SHIFT) & __SWP_OFFSET_MASK)
+
+#define __SWP_TYPE_MASK		((1 << __SWP_TYPE_BITS) - 1)
+#define __SWP_OFFSET_MASK	((1UL << __SWP_OFFSET_BITS) - 1)
+```
+
+有了这两个宏之后，就可以根据 `swp_entry_t` 轻松地定位到匿名页在交换区中的位置了。内核首先会通过 `swp_type` 从 `swp_entry_t`提取出匿名页所在的交换区索引 type，根据 type 就可以从 `swap_info` 数组中定位到交换区数据结构 `swap_info_struct` 。内核将定位交换区 `swap_info_struct` 结构的逻辑封装在 `swp_swap_info` 函数中：
+
+```c
+struct swap_info_struct *swp_swap_info(swp_entry_t entry)
+{
+	return swap_type_to_swap_info(swp_type(entry));
+}
+
+static struct swap_info_struct *swap_type_to_swap_info(int type)
+{
+	return READ_ONCE(swap_info[type]);
+}
+```
+
+最后通过 `swp_offset` 定位匿名页所在 slot 在交换区中的 offset， 然后利用 offset 在红黑树 `swap_extent_root` 中查找其对应的 swap_extent。
+
+```c
+static sector_t map_swap_entry(swp_entry_t entry, struct block_device **bdev)
+{
+    struct swap_info_struct *sis;
+    struct swap_extent *se;
+    pgoff_t offset;
+    // 通过 swap_info[swp_type(entry)]  获取交换区 swap_info_struct 结构
+    sis = swp_swap_info(entry);
+    // 获取交换区所在磁盘分区块设备
+    *bdev = sis->bdev;
+    // 获取匿名页在交换区的偏移 
+    offset = swp_offset(entry);
+    // 通过 offset 到红黑树 swap_extent_root 中查找对应的 swap_extent
+    se = offset_to_swap_extent(sis, offset);
+    // 获取 slot 对应的磁盘块
+    return se->start_block + (offset - se->start_page);
+}
+```
+
+而 swap partition 是一个没有文件系统的裸磁盘分区，其背后的磁盘块都是连续分布的，所以对于 swap partition 来说，slot 与磁盘块是直接映射的，获取到 slot 的 offset 之后，在乘以一个固定的偏移 `2 ^ PAGE_SHIFT - 9` 跳过用于存储交换区元信息的 swap header ，就可以直接获得磁盘块了。这里与内核虚拟内存空间中的直接映射区相似，虚拟内存与物理内存都是直接映射的，通过虚拟内存地址减去一个固定的偏移直接就可以获得物理内存地址了。
+
+```c
+static sector_t swap_page_sector(struct page *page)
+{
+    return (sector_t)__page_file_index(page) << (PAGE_SHIFT - 9);
+}
+
+pgoff_t __page_file_index(struct page *page)
+{
+    // 在 swap 场景中，swp_entry_t 的值会设置到 page 结构中的 private 字段中
+    swp_entry_t swap = { .val = page_private(page) };
+    return swp_offset(swap);
+}
+```
+
+以上是内核在 swap file 和 swap partition 场景下，如何获取 slot 对应的磁盘块 `sector_t` 的逻辑与实现。有了 `sector_t`，内核接着就会利用 `bdev_read_page` 函数将 slot 对应在 sector 中的内容读取到物理内存页 page 中，这就是整个 swap in 的过程。
+
+```c
+/**
+ * bdev_read_page() - Start reading a page from a block device
+ * @bdev: The device to read the page from
+ * @sector: The offset on the device to read the page to (need not be aligned)
+ * @page: The page to read
+ */
+int bdev_read_page(struct block_device *bdev, sector_t sector,
+			struct page *page)
+
+int swap_readpage(struct page *page, bool synchronous)
+{
+    struct bio *bio;
+    int ret = 0;
+    struct swap_info_struct *sis = page_swap_info(page);
+    blk_qc_t qc;
+    struct gendisk *disk;
+    // 处理交换区是 swap file 的情况
+    if (sis->flags & SWP_FS) {
+        // 从交换区中获取交换文件 swap_file
+        struct file *swap_file = sis->swap_file;
+        // swap_file 本质上还是文件系统中的一个文件，所以它也会有 page cache
+        struct address_space *mapping = swap_file->f_mapping;
+        /* 利用 page cache 中的 readpage 方法，从 swap_file 所在的文件系统中读取匿名页内容到 page 中。
+         * 注意这里只是利用 page cache 的 readpage 方法从文件系统中读取数据，内核并不会把 page 加入到 page cache 中
+         * 这里 swap_file 和普通文件的读取过程是不一样的，page cache 不缓存内存页。
+         * 对于 swap out 的场景来说，内核也只是利用 page cache 的 writepage 方法将匿名页的内容写入到 swap_file 中。
+         */
+        ret = mapping->a_ops->readpage(swap_file, page);
+        if (!ret)
+            count_vm_event(PSWPIN);
+        return ret;
+    }
+
+    /* 如果交换区是 swap partition，则直接从磁盘块中读取
+     * 对于 swap out 的场景，内核调用 bdev_write_page，直接将匿名页的内容写入到磁盘块中
+     */
+    ret = bdev_read_page(sis->bdev, swap_page_sector(page), page);
+
+out:
+    return ret;
+}
+```
+
+`swap_readpage` 是内核 swap 机制的最底层实现，直接和磁盘打交道，负责搭建磁盘与内存之间的桥梁。虽然直接调用 `swap_readpage` 可以基本完成 swap in 的目的，但在某些特殊情况下会导致 swap 的性能非常糟糕。比如下图所示，假设当前系统中存在三个进程，它们共享引用了同一个物理内存页 page。
+
+![memory](./images/memory179.png)
+
+当这个被共享的 page 被内核 swap out 到交换区之后，三个共享进程的页表会发生如下变化：
+
+![memory](./images/memory180.png)
+
+当 进程1 开始读取这个共享 page 的时候，由于 page 已经 swap out 到交换区了，所以会发生 swap 缺页异常，进入内核通过 `swap_readpage` 将共享 page 的内容从磁盘中读取进内存，此时三个进程的页表结构变为下图所示：
+
+![memory](./images/memory181.png)
+
+现在共享 page 已经被 进程1 swap in 进来了，但是 进程2 和 进程 3 是不知道的，它们的页表中还储存的是 `swp_entry_t`，依然指向 page 所在交换区的位置。按照之前的逻辑，当 进程2 以及 进程3 开始读取这个共享 page 的时候，其实 page 已经在内存了，但是它们此刻感知不到，因为 进程2 和 进程3 的页表中存储的依然是 `swp_entry_t`，还是会产生 swap 缺页中断，重新通过 `swap_readpage` 读取交换区中的内容，这样一来就产生了额外重复的磁盘 IO。除此之外，更加严重的是，由于 进程2 和 进程3 的 swap 缺页，又会产生两个新的内存页用来存放从 `swap_readpage` 中读取进来的交换区数据。产生了重复的磁盘 IO 不说，还产生了额外的内存消耗，并且这样一来，三个进程对内存页就不是共享的了。
+
+还有一种极端场景是一个进程试图读取一个正在被 swap out 的 page ，由于 page 正在被内核 swap out，此时进程页表指向该 page 的 pte 已经变成了 `swp_entry_t`。进程在这个时候访问 page 的时候，还是会产生 swap 缺页异常，进程试图 swap in 这个正在被内核 swap out 的 page，但是此时 page 仍然还在内存中，只不过是正在被内核刷盘。而按照之前的 swap in 逻辑，进程这里会调用 `swap_readpage` 从磁盘中读取，产生额外的磁盘 IO 以及内存消耗不说，关键是此刻 swap_readpage 出来的数据都不是完整的，这肯定是个大问题。
+
+内核为了解决上面提到的这些问题，因此引入了一个新的结构 —— swap cache 。有了 swap cache 之后，情况就会变得大不相同，回过头来看第一个问题 —— 多进程共享内存页。进程1 在 swap in 的时候首先会到 swap cache 中去查找，看看是否有其他进程已经把内存页 swap in 进来了，如果 swap cache 中没有才会调用 `swap_readpage` 从磁盘中去读取。当内核通过 `swap_readpage` 将内存页中的内容从磁盘中读取进内存之后，内核会把这个匿名页先放入 swap cache 中。进程 1 的页表将原来的 `swp_entry_t` 填充为 pte 并指向 swap cache 中的这个内存页。
+
+![memory](./images/memory182.png)
+
+由于进程1 页表中对应的页表项现在已经从 `swp_entry_t` 变为 pte 了，指向的是 swap cache 中的内存页而不是 swap 交换区，所以对应 slot 的引用计数就要减 1 。即 slot 在 `swap_map` 数组中保存的引用计数从 3 变成了 2 。表示还有两个进程也就是 进程2 和 进程3 仍在继续引用这个 slot 。当进程2 发生 swap 缺页中断的时候进入内核之后，也是首先会到 swap cache 中查找是否现在已经有其他进程把共享的内存页 swap in 进来了，内存页 page 在 swap cache 的索引就是页表中的 `swp_entry_t`。由于这三个进程共享的同一个内存页，所以三个进程页表中的 `swp_entry_t` 都是相同的，都是指向交换区的同一位置。由于共享内存页现在已经被 进程1 swap in 进来了，并存放在 swap cache 中，所以 进程2 通过 `swp_entry_t` 一下就在 swap cache 中找到了，同理，进程 2 的页表也会将原来的 `swp_entry_t` 填充为 pte 并指向 swap cache 中的这个内存页。slot 的引用计数减 1。
+
+![memory](./images/memory183.png)
+
+现在这个 slot 在 `swap_map` 数组中保存的引用计数从 2 变成了 1 。表示只有 进程3 在引用这个 slot 了。当 进程3 发生 swap 缺页中断的之后，内核还是先通过 `swp_entry_t` 到 swap cache 中去查找，找到之后，将 进程 3 页表原来的 `swp_entry_t` 填充为 pte 并指向 swap cache 中的这个内存页，slot 的引用计数减 1。现在 slot 的引用计数已经变为 0 了，这意味着所有共享该内存页的进程已经全部知道了新内存页的地址，它们的 pte 已经全部指向了新内存页，不在指向 slot 了，此时内核便将这个内存页从 swap cache 中移除。
+
+![memory](./images/memory184.png)
+
+针对第二个问题 —— 进程试图 swap in 这个正在被内核 swap out 的 page，内核的处理方法也是一样，内核在 swap out 的时候首先会在交换区中为这个 page 分配 slot 确定其在交换区的位置，然后通过匿名页反向映射机制找到所有引用该内存页的进程，将它们页表中的 pte 修改为指向 slot 的 `swp_entry_t`。然后将匿名页 page 先是放入到 swap cache 中，慢慢地通过 `swap_writepage` 回写。当匿名页被完全回写到交换区中时，内核才会将 page 从 swap cache 中移除。如果当内核正在回写的过程中，不巧有一个进程又要访问该内存页，同样也会发生 swap 缺页中断，但是由于此时没有回写完成，内存页还保存在 swap cache 中，内核通过进程页表中的 `swp_entry_t` 一下就在 swap cache 中找到了，避免了再次发生磁盘 IO，后面的过程就和第一个问题一样了。
+
+![memory](./images/memory185.png)
+
+上述查找 swap cache 的过程。内核封装在 `__read_swap_cache_async` 函数里，在 swap in 的过程中，内核会首先调用这里查看 swap cache 是否已经缓存了内存页，如果没有，则新分配一个内存页并加入到 swap cache 中，最后才会调用 `swap_readpage` 从磁盘中将所需内容读取到新内存页中。
+
+```c
+struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
+            struct vm_area_struct *vma, unsigned long addr,
+            bool *new_page_allocated)
+{
+    struct page *found_page = NULL, *new_page = NULL;
+    struct swap_info_struct *si;
+    int err;
+    // 是否分配新的内存页，如果内存页已经在 swap cache 中则无需分配
+    *new_page_allocated = false;
+
+    do {
+        // 获取交换区结构 swap_info_struct
+        si = get_swap_device(entry);
+        // 首先根据 swp_entry_t 到 swap cache 中查找，内存页是否已经被其他进程 swap in 进来了
+        found_page = find_get_page(swap_address_space(entry),
+                       swp_offset(entry));
+        // swap cache 已经缓存了，就直接返回，不必启动磁盘 IO
+        if (found_page)
+            break;
+        // 如果 swap cache 中没有，则需要新分配一个内存页用来存储从交换区中 swap in 进来的内容
+        if (!new_page) {
+            new_page = alloc_page_vma(gfp_mask, vma, addr);
+            if (!new_page)
+                break;      /* Out of memory */
+        }
+        // swap 没有完成时，内存页需要加锁，禁止访问
+        __SetPageLocked(new_page);
+        __SetPageSwapBacked(new_page);
+        // 将新的内存页先放入 swap cache 中，在这里会将 swp_entry_t 设置到 page 结构的 private 属性中
+        err = add_to_swap_cache(new_page, entry, gfp_mask & GFP_KERNEL);
+    } while (err != -ENOMEM);
+
+    return found_page;
+}
+```
+
+内核会为系统中每一个交换区分配一个 swap cache，被内核组织在一个叫做 `swapper_spaces` 的数组中。交换区的 swap cache 在 `swapper_spaces` 数组中的索引也是 `swp_entry_t` 中存储的 type 信息，通过 `swp_type` 来提取。
+
+```c
+// 一个交换区对应一个 swap cache，与 swap_info 是一一对应关系
+struct address_space *swapper_spaces[MAX_SWAPFILES] __read_mostly;
+```
+
+交换区的 swap cache 和文件的 page cache 一样，都是 `address_space` 结构来描述的，而对于 swap file 来说，因为它本质上是文件系统里的一个文件，所以 swap file 既有 swap cache 也有 page cache 。这里要区分 swap file 的 swap cache 和 page cache，swap file 的 page cache 在 swap 的场景中是不会缓存内存页的，内核只是利用 page cache 相关的操作函数  `address_space->a_ops` ，从 swap file 所在的文件系统中读取或者写入匿名页，匿名页是不会加入到 page cache 中的。而交换区是针对整个系统来说的，系统中会存在很多进程，当发生 swap 的时候，系统中的这些进程会对同一个 swap cache 进行争抢，所以为了近一步提高 swap 的并行度，内核会将一个交换区中的 swap cache 分裂多个出来，将竞争的压力分散开来。这样一来，一个交换就演变出多个 swap cache 出来，`swapper_spaces` 数组其实是一个 `address_space` 结构的二维数组。每个 swap cache 能够管理的匿名页个数为 `2^SWAP_ADDRESS_SPACE_SHIFT` 个，涉及到的内存大小为 `4K * SWAP_ADDRESS_SPACE_PAGES` — 64M。
+
+```c
+/* One swap address space for each 64M swap space */
+#define SWAP_ADDRESS_SPACE_SHIFT	14
+#define SWAP_ADDRESS_SPACE_PAGES	(1 << SWAP_ADDRESS_SPACE_SHIFT)
+```
+
+![memory](./images/memory186.png)
+
+通过一个给定的 `swp_entry_t` 查找对应的 swap cache 的逻辑，内核定义在 `swap_address_space` 宏中。
+
+1. 首先内核通过 `swp_type` 提取交换区在 `swapper_spaces` 数组中的索引（一维索引）。
+2. 通过 `swp_offset >> SWAP_ADDRESS_SPACE_SHIFT`（二维索引），定位 slot 具体归哪一个 swap cache 管理。
+
+```c
+#define swap_address_space(entry)			    \
+	(&swapper_spaces[swp_type(entry)][swp_offset(entry) \
+		>> SWAP_ADDRESS_SPACE_SHIFT])
+
+struct page * lookup_swap_cache(swp_entry_t entry)  
+{          
+    struct swap_info_struct *si = get_swap_device(entry);
+    // 通过 swp_entry_t 定位 swap cache，根据 swp_offset 在 swap cache 中查找内存页
+    page = find_get_page(swap_address_space(entry), swp_offset(entry));        
+    return page;  
+}
+```
+
+当通过 `swapon` 命令来初始化并激活一个交换区的时候，内核会在 `init_swap_address_space` 函数中为交换区初始化 swap cache。
+
+```c
+int init_swap_address_space(unsigned int type, unsigned long nr_pages)
+{
+    struct address_space *spaces, *space;
+    unsigned int i, nr;
+    // 计算交换区包含的 swap cache 个数
+    nr = DIV_ROUND_UP(nr_pages, SWAP_ADDRESS_SPACE_PAGES);
+    // 为交换区分配 address_space 数组，用于存放多个 swap cache
+    spaces = kvcalloc(nr, sizeof(struct address_space), GFP_KERNEL);
+    // 挨个初始化交换区中的 swap cache
+    for (i = 0; i < nr; i++) {
+        space = spaces + i;
+        // 将 a_ops 指定为 swap_aops
+        space->a_ops = &swap_aops;
+        /* swap cache doesn't use writeback related tags */
+        // swap cache 不会回写
+        mapping_set_no_writeback_tags(space);
+    }
+    // 保存交换区中的 swap cache 个数
+    nr_swapper_spaces[type] = nr;
+    // 将初始化好的 address_space 数组放入 swapper_spaces 数组中（二维数组）
+    swapper_spaces[type] = spaces;
+
+    return 0;
+}
+
+// 交换区中的 swap cache 个数
+static unsigned int nr_swapper_spaces[MAX_SWAPFILES] __read_mostly;
+
+struct address_space *swapper_spaces[MAX_SWAPFILES] __read_mostly;
+
+// 对于 swap cache 来说，内核会将 address_space-> a_ops 初始化为 swap_aops。
+static const struct address_space_operations swap_aops = {
+	.writepage	= swap_writepage,
+	.set_page_dirty	= swap_set_page_dirty,
+#ifdef CONFIG_MIGRATION
+	.migratepage	= migrate_page,
+#endif
+};
+```
+
+完整的 swap 流程还需要考虑内存访问的空间局部性原理。当进程访问某一段内存的时候，在不久之后，其附近的内存地址也将被访问。即当进程地址空间中的某一个虚拟内存地址 address 被访问之后，那么其周围的虚拟内存地址在不久之后，也会被进程访问。而那些相邻的虚拟内存地址，在进程页表中对应的页表项也都是相邻的，当处理完了缺页地址 address 的 swap 缺页异常之后，如果其相邻的页表项均是 `swp_entry_t`，那么这些相邻的 `swp_entry_t` 所指向交换区的内容也需要被内核预读进内存中。这样一来，当 address 附近的虚拟内存地址发生 swap 缺页的时候，内核就可以直接从 swap cache 中读到了，避免了磁盘 IO，使得 swap in 可以快速完成，这里和文件的预读机制有点类似。swap 预读在 Linux 内核中由 `swapin_readahead` 函数负责，它有两种实现方式：
+
+- 第一种是根据缺页地址 address 周围的虚拟内存地址进行预读，但前提是它们必须属于同一个 vma，这个逻辑在 `swap_vma_readahead` 函数中完成。
+- 第二种是根据内存页在交换区中周围的磁盘地址进行预读，但前提是它们必须属于同一个交换区，这个逻辑在 `swap_cluster_readahead` 函数中完成。
+
+```c
+struct page *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
+                struct vm_fault *vmf)
+{
+    return swap_use_vma_readahead() ?
+            swap_vma_readahead(entry, gfp_mask, vmf) :
+            swap_cluster_readahead(entry, gfp_mask, vmf);
+}
+```
+
+在函数 `swap_vma_readahead` 的开始，内核首先调用 `swap_ra_info` 方法来计算本次需要预读的页表项集合。预读的最大页表项个数由 `page_cluster` 决定，但最大不能超过 `2 ^ SWAP_RA_ORDER_CEILING`。`page_cluster` 的值可以通过内核参数 `/proc/sys/vm/page-cluster` 来调整，默认值为 3，可以通过设置 `page_cluster = 0`来禁止 swap 预读。
+
+```c
+#ifdef CONFIG_64BIT
+#define SWAP_RA_ORDER_CEILING	5
+// 最大预读窗口
+max_win = 1 << min_t(unsigned int, READ_ONCE(page_cluster),
+			     SWAP_RA_ORDER_CEILING);
+```
+
+当要 swap in 的内存页在交换区的位置已经接近末尾了，则需要减少预读页的个数，防止预读超出交换区的边界。如果预读的页表项不是 `swp_entry_t`，则说明该页表项是一个空的还没有进行过映射或者页表项指向的内存页还在内存中，这种情况下则跳过，继续预读后面的 `swp_entry_t`。
+
+```c
+/**
+ * swap_vma_readahead - swap in pages in hope we need them soon
+ * @entry: swap entry of this memory
+ * @gfp_mask: memory allocation flags
+ * @vmf: fault information
+ *
+ * Returns the struct page for entry and addr, after queueing swapin.
+ *
+ * Primitive swap readahead code. We simply read in a few pages whoes
+ * virtual addresses are around the fault address in the same vma.
+ *
+ * Caller must hold read mmap_sem if vmf->vma is not NULL.
+ *
+ */
+static struct page *swap_vma_readahead(swp_entry_t fentry, gfp_t gfp_mask,
+                       struct vm_fault *vmf)
+{
+    struct vm_area_struct *vma = vmf->vma;
+    struct vma_swap_readahead ra_info = {0,};
+    // 获取本次要进行预读的页表项
+    swap_ra_info(vmf, &ra_info);
+    // 遍历预读窗口 ra_info 中的页表项，挨个进行预读
+    for (i = 0, pte = ra_info.ptes; i < ra_info.nr_pte;
+         i++, pte++) {
+        // 获取要进行预读的页表项
+        pentry = *pte;
+        // 页表项为空，表示还未进行内存映射，直接跳过
+        if (pte_none(pentry))
+            continue;
+        // 页表项指向的内存页仍然在内存中，跳过
+        if (pte_present(pentry))
+            continue;
+        // 将 pte 转换为 swp_entry_t
+        entry = pte_to_swp_entry(pentry);
+        if (unlikely(non_swap_entry(entry)))
+            continue;
+        /* 利用 swp_entry_t 先到 swap cache 中去查找
+         * 如果没有，则新分配一个内存页并添加到 swap cache 中，这种情况下 page_allocated = true
+         * 如果有，则直接从swap cache 中获取内存页，也就不需要预读了，page_allocated = false
+         */
+        page = __read_swap_cache_async(entry, gfp_mask, vma,
+                           vmf->address, &page_allocated);
+
+        if (page_allocated) {
+            // 发生磁盘 IO，从交换区中读取内存页的内容到新分配的 page 中
+            swap_readpage(page, false);
+        }
+    }
+}
+```
+
+这样一来，经过 `swap_vma_readahead` 预读之后，缺页内存地址 address 周围的页表项所指向的内存页就全部被加载到 swap cache 中了。当进程下次访问 address 周围的内存地址时，虽然也会发生 swap 缺页异常，但是内核直接从 swap cache 中就可以读取到了，避免了磁盘 IO。
+
+![memory](./images/memory187.png)
+
+完整的 swap in 过程：
+
+1. 首先内核会通过 `pte_to_swp_entry` 将进程页表中的 pte 转换为 `swp_entry_t`
+2. 通过 `lookup_swap_cache` 根据 `swp_entry_t` 到 swap cache 中查找是否已经有其他进程将内存页 swap 进来了。
+3. 如果 swap cache 没有对应的内存页，则调用 `swapin_readahead` 启动预读，在这个过程中，内核会重新分配物理内存页，并将这个物理内存页加入到 swap cache 中，随后通过 `swap_readpage` 将交换区的内容读取到这个内存页中。
+4. 现在需要的内存页已经 swap in 到内存中了，后面的流程就和普通的缺页处理一样了，根据 swap in 进来的内存页地址重新创建初始化一个新的 pte，然后用这个新的 pte，将进程页表中原来的 `swp_entry_t` 替换掉。
+5. 为新的内存页建立反向映射关系，加入 lru active list 中，最后 `swap_free` 释放交换区中的资源。
+
+![memory](./images/memory188.png)
+
+```c
+vm_fault_t do_swap_page(struct vm_fault *vmf)
+{
+    // 将缺页内存地址 address 对应的 pte 转换为 swp_entry_t
+    entry = pte_to_swp_entry(vmf->orig_pte);  
+    // 首先利用 swp_entry_t 到 swap cache 查找，看内存页已经其他进程被 swap in 进来
+    page = lookup_swap_cache(entry, vma, vmf->address);
+    swapcache = page;
+    // 处理匿名页不在 swap cache 的情况
+    if (!page) {
+        // 通过 swp_entry_t 获取对应的交换区结构
+        struct swap_info_struct *si = swp_swap_info(entry);
+        // 针对 fast swap storage 比如 zram 等 swap 的性能优化，跳过 swap cache
+        if (si->flags & SWP_SYNCHRONOUS_IO &&
+                __swap_count(entry) == 1) {
+            /* skip swapcache */
+            /* 当只有单进程引用这个匿名页的时候，直接跳过 swap cache
+             * 从伙伴系统中申请内存页 page，注意这里的 page 并不会加入到 swap cache 中
+             */
+            page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma,
+                            vmf->address);
+            if (page) {
+                __SetPageLocked(page);
+                __SetPageSwapBacked(page);
+                set_page_private(page, entry.val);
+                // 加入 lru 链表
+                lru_cache_add_anon(page);
+                // 直接从 fast storage device 中读取被换出的内容到 page 中
+                swap_readpage(page, true);
+            }
+        } else {
+            // 启动 swap 预读
+            page = swapin_readahead(entry, GFP_HIGHUSER_MOVABLE,
+                        vmf);
+            swapcache = page;
+        }
+
+        // 因为涉及到了磁盘 IO，所以本次缺页异常属于 FAULT_MAJOR 类型
+        ret = VM_FAULT_MAJOR;
+        count_vm_event(PGMAJFAULT);
+        count_memcg_event_mm(vma->vm_mm, PGMAJFAULT);
+    } 
+
+    // 现在之前被换出的内存页已经被内核重新 swap in 到内存中了。下面就是重新设置 pte，将原来页表中的 swp_entry_t 替换掉
+    vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
+            &vmf->ptl);
+    // 增加匿名页的统计计数
+    inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
+    // 减少 swap entries 计数
+    dec_mm_counter_fast(vma->vm_mm, MM_SWAPENTS);
+    // 根据被 swap in 进来的新内存页重新创建 pte
+    pte = mk_pte(page, vma->vm_page_prot);
+    // 用新的 pte 替换掉页表中的 swp_entry_t
+    set_pte_at(vma->vm_mm, vmf->address, vmf->pte, pte);
+    vmf->orig_pte = pte;
+
+    // 建立新内存页的反向映射关系
+    do_page_add_anon_rmap(page, vma, vmf->address, exclusive);
+    // 将内存页添加到 lru 的 active list 中
+    activate_page(page);
+    // 释放交换区中的资源
+    swap_free(entry);
+    // 刷新 mmu cache
+    update_mmu_cache(vma, vmf->address, vmf->pte);
+    return ret;
+}
+```
+
+
+
+### slab
+
+#### slab 存在的意义
+
+伙伴系统管理物理内存的最小单位是物理内存页 page。也就是说向伙伴系统申请内存时，至少要申请一个物理内存页。而从内核实际运行过程中来看，无论是从内核态还是从用户态的角度来说，对于内存的需求量往往是以字节为单位，通常是几十字节到几百字节不等，远远小于一个页面的大小。如果仅仅为了这几十字节的内存需求，而专门为其分配一整个内存页面，这无疑是对宝贵内存资源的一种巨大浪费。于是在内核中，这种专门针对小内存的分配需求就应运而生了。
+
+slab 首先会向伙伴系统一次性申请一个或者多个物理内存页面，正是这些物理内存页组成了 slab 内存池。随后 slab 内存池会将这些连续的物理内存页面划分成多个大小相同的小内存块出来，同一种 slab 内存池下，划分出来的小内存块尺寸是一样的。内核会针对不同尺寸的小内存分配需求，预先创建出多个 slab 内存池出来。这种小内存在内核中的使用场景非常之多，比如，内核中那些经常使用，需要频繁申请释放的一些核心数据结构对象：task_struct 对象，mm_struct 对象，struct page 对象，struct file 对象，socket 对象等。而创建这些内核核心数据结构对象以及为这些核心对象分配内存，销毁这些内核对象以及释放相关的内存是需要性能开销的。而buddy分配器整个内存分配链路还是比较长的，如果遇到内存不足，还会涉及到内存的 swap 和 compact ，从而进一步产生更大的性能开销。
+
+既然 slab 专门是用于小内存块分配与回收的，那么内核很自然的就会想到，分别为每一个需要被内核频繁创建和释放的核心对象创建一个专属的 slab 对象池，这些内核对象专属的 slab 对象池会根据其所管理的具体内核对象所占用内存的大小 size，将一个或者多个完整的物理内存页按照这个 size 划分出多个大小相同的小内存块出来，每个小内存块用于存储预先创建好的内核对象。这样一来，当内核需要频繁分配和释放内核对象时，就可以直接从相应的 slab 对象池中申请和释放内核对象，避免了链路比较长的内存分配与释放过程，极大地提升了性能。这是一种池化思想的应用。将内核中的核心数据结构对象，池化在 slab 对象池中，除了可以避免内核对象频繁反复初始化和相关内存分配，频繁反复销毁对象和相关内存释放的性能开销之外，其实还有很多好处，比如：
+
+1. 利用 CPU 高速缓存提高访问速度。当一个对象被直接释放回 slab 对象池中的时候，这个内核对象还是“热的”，仍然会驻留在 CPU 高速缓存中。如果这时，内核继续向 slab 对象池申请对象，slab 对象池会优先把这个刚刚释放 “热的” 对象分配给内核使用，因为对象很大概率仍然驻留在 CPU 高速缓存中，所以内核访问起来速度会更快。
+2. 伙伴系统只能分配 2 的次幂个完整的物理内存页，这会引起占用高速缓存以及 TLB 的空间较大，导致一些不重要的数据驻留在 CPU 高速缓存中占用宝贵的缓存空间，而重要的数据却被置换到内存中。 slab 对象池针对小内存分配场景，可以有效的避免这一点。
+3. 调用伙伴系统的操作会对 CPU 高速缓存 L1Cache 中的 Instruction Cache（指令高速缓存）和 Data Cache （数据高速缓存）有污染，因为对伙伴系统的长链路调用，相关的一些指令和数据必然会填充到 Instruction Cache 和 Data Cache 中，从而将频繁使用的一些指令和数据挤压出去，造成缓存污染。而在内核空间中越浪费这些缓存资源，那么在用户空间中的进程就会越少的得到这些缓存资源，造成性能的下降。 slab 对象池极大的减少了对伙伴系统的调用，防止了不必要的 L1Cache 污染。
+4. 使用 slab 对象池可以充分利用 CPU 高速缓存，避免多个对象对同一 cache line 的争用。如果对象直接存储排列在伙伴系统提供的内存页中的话（不受 slab 管理），那么位于不同内存页中具有相同偏移的对象很可能会被放入同一个 cache line 中，即使其他 cache line 还是空的。
+
+
+
+#### slab/slub/slob
+
+slab 的实现，最早是由 Sun 公司的 Jeff Bonwick 在 Solaris 2.4 系统中设计并实现的，由于 Jeff Bonwick 公开了 slab 的实现方法，因此被 Linux 所借鉴并于 1996 年在 Linux 2.0 版本中引入了 slab，用于 Linux 内核早期的小内存分配场景。由于 slab 的实现非常复杂，slab 中拥有多种存储对象的队列，队列管理开销比较大，slab 元数据比较臃肿，对 NUMA 架构的支持臃肿繁杂（slab 引入时内核还没支持 NUMA），这样导致 slab 内部为了维护这些自身元数据管理结构就得花费大量的内存空间，这在配置有超大容量内存的服务器上，内存的浪费是非常可观的。
+
+针对以上 slab 的不足，内核 Christoph Lameter 在 2.6.22 版本（2007 年发布）中引入了新的 slub 实现。slub 简化了 slab 一些复杂的设计，同时保留了 slab 的基本思想，摒弃了 slab 众多管理队列的概念，并针对多处理器，NUMA 架构进行优化，放弃了效果不太明显的 slab 着色机制。slub 与 slab 相比，提高了性能，吞吐量，并降低了内存的浪费。成为现在内核中常用的 slab 实现。
+
+而 slob 的实现是在内核 2.6.16 版本（2006 年发布）引入的，它是专门为嵌入式小型机器小内存的场景设计的，所以实现上很精简，能在小型机器上提供很不错的性能。
+
+而内核中关于内存池（小内存分配器）的相关 API 接口函数均是以 slab 命名的，但是可以通过配置的方式来平滑切换以上三种 slab 的实现。
+
+#### slab 设计理念
+
+![memory](./images/memory189.png)
+
+如上图所示，slab 对象池在内存管理系统中的架构层次是基于伙伴系统之上构建的，slab 对象池会一次性向伙伴系统申请一个或者多个完整的物理内存页，在这些完整的内存页内在逐步划分出一小块一小块的内存块出来，而这些小内存块的尺寸就是 slab 对象池所管理的内核核心对象占用的内存大小。
+
+如果要设计一个对象池，首先最直观最简单的办法就是先向伙伴系统申请一个内存页（也可以多个页），然后按照需要被池化对象的尺寸 object size，把内存页划分为一个一个的内存块，每个内存块尺寸就是 object size。
+
+![memory](./images/memory190.png)
+
+但是在一个工业级的对象池设计中，不能这么简单粗暴的搞，因为对象的 object size 可以是任意的，并不是内存对齐的，CPU 访问一块没有进行对齐的内存比访问对齐的内存速度要慢一倍。因为 CPU 向内存读取数据的单位是根据 word size 来的，在 64 位处理器中 word size = 8 字节，所以 CPU 向内存读写数据的单位为 8 字节。CPU 只能一次性向内存访问按照 word size ( 8 字节) 对齐的内存地址，如果 CPU 访问一个未进行 word size 对齐的内存地址，就会经历两次访存操作。
+
+比如访问 0x0007 - 0x0014 这样一段没有对 word size 进行对齐的内存，CPU 只能先从 0x0000 - 0x0007 读取 8 个字节出来先放入结果寄存器中并左移 7 个字节（目的是只获取 0x0007 ），然后 CPU 在从 0x0008 - 0x0015 读取 8 个字节出来放入临时寄存器中并右移1个字节（目的是获取 0x0008 - 0x0014 ）最后与结果寄存器或运算。最终得到 0x0007 - 0x0014 地址段上的 8 个字节。
+
+![memory](./images/memory191.png)
+
+从上面过程可以看出，CPU 访问一段未进行 word size 对齐的内存，需要两次访存操作。内存对齐的好处还有很多，比如，CPU 访问对齐的内存都是原子性的，对齐内存中的数据会独占 cache line ，不会与其他数据共享 cache line，避免 false sharing。
+
+基于以上原因，不能简单的按照对象尺寸 object size 来划分内存块，而是需要考虑到对象内存地址要按照 word size 进行对齐。于是上面的 slab 对象池的内存布局又有了新的变化。如果被池化对象的尺寸 object size 本来就是和 word size 对齐的，那么不需要做任何事情，但是如果 object size 没有和 word size 对齐，就需要填充一些字节，目的是要让对象的 object size 按照 word size 进行对齐，提高 CPU 访问对象的速度。
+
+![memory](./images/memory192.png)
+
+但是上面的这些工作对于一个工业级的对象池来说还远远不够，工业级的对象池需要应对很多复杂的诡异场景，比如，偶尔在复杂生产环境中会遇到的内存读写访问越界的情况，这会导致很多莫名其妙的异常。内核为了应对内存读写越界的场景，于是在对象内存的周围插入了一段不可访问的内存区域，这些内存区域用特定的字节 0xbb 填充，当进程访问的到内存是 0xbb 时，表示已经越界访问了。这段内存区域在 slab 中的术语为 red zone，大家可以理解为红色警戒区域。插入 red zone 之后，slab 对象池的内存布局近一步演进为下图所示的布局：
+
+![memory](./images/memory193.png)
+
+- 如果对象尺寸 object size 本身就是 word size 对齐的，那么就需要在对象左右两侧填充两段 red zone 区域，red zone 区域的长度一般就是 word size 大小。
+- 如果对象尺寸 object size 是通过填充 padding 之后，才与 word size 对齐。内核会巧妙的利用对象右边的这段 padding 填充区域作为 red zone。只需要额外的在对象内存区域的左侧填充一段 red zone 即可。
+
+![memory](./images/memory194.png)
+
+从 slab 对象池获取到一个空闲对象之后，需要知道它的下一个空闲对象在哪里，这样方便下次获取对象。即该如何将内存页 page 中的这些空闲对象串联起来。最简单的想法是，用一个链表把这些空闲对象串联起来。不过内核巧妙的地方在于不需要为串联对象所用到的 next 指针额外的分配内存空间。因为对象在 slab 中没有被分配出去使用的时候，其实对象所占的内存中存放什么，用户根本不会关心的。既然这样，内核干脆就把指向下一个空闲对象的 freepointer 指针直接存放在对象所占内存（object size）中，这样避免了为 freepointer 指针单独再分配内存空间。巧妙的利用了对象所在的内存空间（object size）。 slab 对象池中各个对象的状态，比如是否处于空闲状态，和 freepointer 的处理方式一样。
+
+![memory](./images/memory195.png)
+
+当 slab 刚刚从伙伴系统中申请出来，并初始化划分物理内存页中的对象内存空间时，内核会将对象的 object size 内存区域用特殊字节 0x6b 填充，并用 0xa5 填充对象 object size 内存区域的最后一个字节表示填充完毕。或者当对象被释放回 slab 对象池中的时候，也会用这些字节填充对象的内存区域。
+
+![memory](./images/memory196.png)
+
+这种通过在对象内存区域填充特定字节表示对象的特殊状态的行为，在 slab 中有一个专门的术语叫做 SLAB_POISON （SLAB 中毒）。POISON 这个术语起的真的是只可意会不可言传，其实就是表示 slab 对象的一种状态。是否毒化 slab 对象是可以设置的，当 slab 对象被 POISON 之后，那么会有一个问题，即存放在对象内存区域 object size 里的 freepointer 就被会特殊字节 0x6b 覆盖掉。这种情况下，内核就只能为 freepointer 在额外分配一个 word size 大小的内存空间了。
+
+![memory](./images/memory197.png)
+
+slab 对象的内存布局信息除了以上内容之外，有时候=还需要去跟踪一下对象的分配和释放相关信息，而这些信息也需要在 slab 对象中存储，内核中使用一个 `struct track` 结构体来存储跟踪信息。这样一来，slab 对象的内存区域中就需要在开辟出两个 `sizeof(struct track)` 大小的区域出来，用来分别存储 slab 对象的分配和释放信息。
+
+![memory](./images/memory198.png)
+
+上图展示的就是 slab 对象在内存中的完整布局，其中 object size 为对象真正所需要的内存区域大小，而对象在 slab 中真实的内存占用大小 size 除了 object size 之外，还包括填充的 red zone 区域，以及用于跟踪对象分配和释放信息的 track 结构，另外，如果 slab 设置了 red zone，内核会在对象末尾增加一段 word size 大小的填充 padding 区域。当 slab 向伙伴系统申请若干内存页之后，内核会按照这个 size 将内存页划分成一个一个的内存块，内存块大小为 size 。
+
+![memory](./images/memory199.png)
+
+**其实 slab 的本质就是一个或者多个物理内存页 page**，内核会根据上图展示的 slab 对象的内存布局，计算出对象的真实内存占用 size。最后根据这个 size 在 slab 背后依赖的这一个或者多个物理内存页 page 中划分出多个大小相同的内存块出来。所以在内核中，都是用 `struct page` 结构来表示 slab，如果 slab 背后依赖的是多个物理内存页，那就使用 `compound_page` 来表示。
+
+```c
+/* slab 的具体信息也是在 struct page 中存储。考虑到 struct page 结构已经非常庞大且复杂，
+ * 为了减少 struct page 的内存占用以及提高可读性，内核在 5.17 版本中专门为 slab 引入了一个管理结构 struct slab，
+ * 将原有 struct page 中 slab 相关的字段全部删除，转移到了 struct slab 结构中。
+ */
+struct page {
+
+        struct {    /*  slub 相关字段 */
+            union {
+                // slab 所在的管理链表
+                struct list_head slab_list;
+                struct {    /* Partial pages */
+                    // 用 next 指针在相应管理链表中串联起 slab
+                    struct page *next;
+#ifdef CONFIG_64BIT
+                    // slab 所在管理链表中的包含的 slab 总数
+                    int pages;  
+                    // slab 所在管理链表中包含的对象总数
+                    int pobjects; 
+#else
+                    short int pages;
+                    short int pobjects;
+#endif
+                };
+            };
+            /* 指向 slab cache，slab cache 就是真正的对象池结构，里边管理了多个 slab
+             * 这多个 slab 被 slab cache 管理在了不同的链表上
+             */
+            struct kmem_cache *slab_cache;
+            // 指向 slab 中第一个空闲对象
+            void *freelist;     /* first free object */
+            union {
+                struct {            /* SLUB */
+                    // slab 中已经分配出去的对象
+                    unsigned inuse:16;
+                    // slab 中包含的对象总数
+                    unsigned objects:15;
+                    // 该 slab 是否在对应 slab cache 的本地 CPU 缓存中，frozen = 1 表示缓存再本地 cpu 缓存中
+                    unsigned frozen:1;
+                };
+            };
+        };
+
+}
+```
+
+#### slab 总体架构
+
+![memory](./images/memory200.png)
+
+如果一个 slab 中的对象全部分配出去了，slab cache 就会将其视为一个 full slab，表示这个 slab 此刻已经满了，无法在分配对象了。slab cache 就会到伙伴系统中重新申请一个 slab 出来，供后续的内存分配使用。
+
+![memory](./images/memory201.png)
+
+当内核将对象释放回其所属的 slab 之后，如果 slab 中的对象全部归位，slab cache 就会将其视为一个 empty slab，表示 slab 此刻变为了一个完全空闲的 slab。如果超过了 slab cache 中规定的 empty slab 的阈值，slab cache 就会将这些空闲的 empty slab 重新释放回伙伴系统中。
+
+![memory](./images/memory202.png)
+
+如果一个 slab 中的对象部分被分配出去使用，部分却未被分配仍然在 slab 中缓存，那么内核就会将该 slab 视为一个 partial slab。
+
+![memory](./images/memory203.png)
+
+这些不同状态的 slab，会在 slab cache 中被不同的链表所管理，同时 slab cache 会控制管理链表中 slab 的个数以及链表中所缓存的空闲对象个数，防止它们无限制的增长。
+
+slab cache 中除了需要管理众多的 slab 之外，还包括了很多 slab 的基础信息。比如：
+
+- slab 对象内存布局相关的信息
+- slab 中的对象需要按照什么方式进行内存对齐，比如，按照 CPU 硬件高速缓存行 cache line (64 字节) 进行对齐，slab 对象是否需要进行毒化 POISON，是否需要在 slab 对象内存周围插入 red zone，是否需要追踪 slab 对象的分配与回收信息，等等。
+- 一个 slab 具体到底需要多少个物理内存页 page，一个 slab 中具体能够容纳多少个 object （内存块）。
+
+##### slab 的基础信息管理
+
+```c
+/*
+ * Slab cache management.
+ */
+struct kmem_cache {
+    /* slab cache 的管理标志位，用于设置 slab 的一些特性
+     * 比如：slab 中的对象按照什么方式对齐，对象是否需要 POISON 毒化，
+     * 是否插入 red zone 在对象内存周围，是否追踪对象的分配和释放信息 等等
+     */
+    slab_flags_t flags;
+    // slab 对象在内存中的真实占用，包括为了内存对齐填充的字节数，red zone 等等
+    unsigned int size;  /* The size of an object including metadata */
+    // slab 中对象的实际大小，不包含填充的字节数
+    unsigned int object_size;/* The size of an object without metadata */
+    /* slab 对象池中的对象在没有被分配之前，我们是不关心对象里边存储的内容的。
+     * 内核巧妙的利用对象占用的内存空间存储下一个空闲对象的地址。
+     * offset 表示用于存储下一个空闲对象指针的位置距离对象首地址的偏移
+     */
+    unsigned int offset;    /* Free pointer offset */
+    /* 表示 cache 中的 slab 大小，包括 slab 所需要申请的页面个数，以及所包含的对象个数
+     * 其中低 16 位表示一个 slab 中所包含的对象总数，高 16 位表示一个 slab 所占有的内存页个数。
+     */
+    struct kmem_cache_order_objects oo;
+    // slab 中所能包含对象以及内存页个数的最大值，内核在初始化 slab 的时候，会将 max 的值设置为 oo。	
+    struct kmem_cache_order_objects max;
+    // 当按照 oo 的尺寸为 slab 申请内存时，如果内存紧张，会采用 min 的尺寸为 slab 申请内存，可以容纳一个对象即可。
+    struct kmem_cache_order_objects min;
+    // 向伙伴系统申请内存时使用的内存分配标识
+    gfp_t allocflags; 
+    // slab cache 的引用计数，为 0 时就可以销毁并释放内存回伙伴系统重
+    int refcount;   
+    // 池化对象的构造函数，用于创建 slab 对象池中的对象
+    void (*ctor)(void *);
+    // 对象的 object_size 按照 word 字长对齐之后的大小
+    unsigned int inuse;  
+    /* 在创建 slab cache 的时候，可以向内核指定 slab 中的对象按照 align 的值进行对齐，内核会综合 word size ,
+     * cache line ，align 计算出一个合理的对齐尺寸。
+     */
+    unsigned int align; 
+    // slab cache 的名称， 也就是在 slabinfo 命令中 name 那一列
+    const char *name;  
+};
+```
+
+`slab_flags_t flags` 是 slab cache 的管理标志位，用于设置 slab 的一些特性，比如：
+
+- 当 flags 设置了 SLAB_HWCACHE_ALIGN 时，表示 slab 中的对象需要按照 CPU 硬件高速缓存行 cache line (64 字节) 进行对齐。
+
+- 当 flags 设置了 SLAB_POISON 时，表示需要在 slab 对象内存中填充特殊字节 0x6b 和 0xa5，表示对象的特定状态。
+- 当 flags 设置了 SLAB_RED_ZONE 时，表示需要在 slab 对象内存周围插入 red zone，防止内存的读写越界。
+- 当 flags 设置了 SLAB_CACHE_DMA 或者 SLAB_CACHE_DMA32 时，表示指定 slab 中的内存来自于哪个内存区域，DMA or DMA32 区域 ？如果没有特殊指定，slab 中的内存一般来自于 NORMAL 直接映射区域。
+- 当 flags 设置了 SLAB_STORE_USER 时，表示需要追踪对象的分配和释放相关信息，这样会在 slab 对象内存区域中额外增加两个 `sizeof(struct track)` 大小的区域出来，用于存储 slab 对象的分配和释放信息。
+
+相关 slab cache 的标志位 flag，定义在内核文件 `/include/linux/slab.h` 中：
+
+```c
+/* DEBUG: Red zone objs in a cache */
+#define SLAB_RED_ZONE  ((slab_flags_t __force)0x00000400U)
+/* DEBUG: Poison objects */
+#define SLAB_POISON  ((slab_flags_t __force)0x00000800U)
+/* Align objs on cache lines */
+#define SLAB_HWCACHE_ALIGN ((slab_flags_t __force)0x00002000U)
+/* Use GFP_DMA memory */
+#define SLAB_CACHE_DMA  ((slab_flags_t __force)0x00004000U)
+/* Use GFP_DMA32 memory */
+#define SLAB_CACHE_DMA32 ((slab_flags_t __force)0x00008000U)
+/* DEBUG: Store the last owner for bug hunting */
+#define SLAB_STORE_USER 
+```
+
+![memory](./images/memory204.png)
+
+`cat /proc/slabinfo` 命令的显示结构主要由三部分组成：
+
+- statistics 部分显示的是 slab cache 的基本统计信息，这部分是最常用的，下面是每一列的含义：
+  - active_objs 表示 slab cache 中已经被分配出去的对象个数
+  - num_objs 表示 slab cache 中容纳的对象总数
+  - objsize 表示 slab 中对象的 object size ，单位为字节
+  - objperslab 表示 slab 中可以容纳的对象个数
+  - pagesperslab 表示 slab 所需要的物理内存页个数
+- tunables 部分显示的 slab cache 的动态可调节参数，如果采用的 slub 实现，那么 tunables 部分全是 0 ，`/proc/slabinfo` 文件不可写，无法动态修改相关参数。如果使用的 slab 实现的话，可以通过 `# echo 'name limit batchcount sharedfactor' > /proc/slabinfo` 命令动态修改相关参数。命令中指定的 name 就是 kmem_cache 结构中的 name 属性。
+  - limit 表示在 slab 的实现中，slab cache 的 cpu 本地缓存 array_cache 最大可以容纳的对象个数
+  - batchcount 表示当 array_cache 中缓存的对象不够时，需要一次性填充的空闲对象个数。
+- slabdata 部分显示的 slab cache 的总体信息，其中 active_slabs 一列展示的 slab cache 中活跃的 slab 个数。nums_slabs 一列展示的是 slab cache 中管理的 slab 总数
+
+在 `cat /proc/slabinfo` 命令显示的这些系统中所有的 slab cache，内核会将这些 slab cache 用一个双向链表统一串联起来。链表的头结点指针保存在 struct kmem_cache 结构的 list 中。
+
+```c
+struct kmem_cache {
+    // 用于组织串联系统中所有类型的 slab cache
+    struct list_head list;  /* List of slab caches */
+}
+```
+
+![memory](./images/memory205.png)
+
+系统中所有的这些 slab cache 占用的内存总量，可以通过 `cat /proc/meminfo` 命令查看：
+
+![memory](./images/memory206.png)
+
+除此之外，还可以通过 `slabtop` 命令来动态查看系统中占用内存最高的 slab cache，当内存紧张的时候，如果通过 `cat /proc/meminfo` 命令发现 slab 的内存占用较高的话，那么可以快速通过 `slabtop` 迅速定位到究竟是哪一类的 object 分配过多导致内存占用飙升。
+
+![memory](./images/memory207.png)
+
+##### slab 的组织架构
+
+slab cache 其实就是内核中的一个对象池，充分考虑了多进程并发访问 slab cache 所带来的同步性能开销，内核在 slab cache 的设计中为每个 CPU 引入了 `struct kmem_cache_cpu` 结构的 percpu 变量，作为 slab cache 在每个 CPU 中的本地缓存。这样一来，当进程需要向 slab cache 申请对应的内存块（object）时，首先会直接来到 `kmem_cache_cpu` 中查看 CPU 本地缓存的 slab，如果本地缓存的 slab 中有空闲对象，那么就直接返回了，整个过程完全没有加锁。而且访问路径特别短，防止了对 CPU 硬件高速缓存 L1Cache 中的 Instruction Cache（指令高速缓存）污染。下面来看一下 slab cache 它的 cpu 本地缓存 `kmem_cache_cpu` 结构的详细设计细节：
+
+```c
+struct kmem_cache_cpu {
+    // 指向被 CPU 本地缓存的 slab 中第一个空闲的对象
+    void **freelist;    /* Pointer to next available object */
+    // 保证进程在 slab cache 中获取到的 cpu 本地缓存 kmem_cache_cpu 与当前执行进程的 cpu 是一致的。
+    unsigned long tid;  /* Globally unique transaction id */
+    // slab cache 中 CPU 本地所缓存的 slab，由于 slab 底层的存储结构是内存页 page，所以这里直接用内存页 page 表示 slab
+    struct page *page;  /* The slab from which we are allocating */
+#ifdef CONFIG_SLUB_CPU_PARTIAL
+    /* cpu cache 缓存的备用 slab 列表，同样也是用 page 表示
+     * 当被本地 cpu 缓存的 slab 中没有空闲对象时，内核会从 partial 列表中的 slab 中查找空闲对象
+     */
+    struct page *partial;   /* Partially allocated frozen slabs */
+#endif
+#ifdef CONFIG_SLUB_STATS
+    // 记录 slab 分配对象的一些状态信息
+    unsigned stat[NR_SLUB_STAT_ITEMS];
+#endif
+};
+```
+
+![memory](./images/memory208.png)
+
+事实上，在 `struct page` 结构中也有一个 freelist 指针，用于指向该内存页中第一个空闲对象。当 slab 被缓存进 `kmem_cache_cpu` 中之后，page 结构中的 freelist 会赋值给 `kmem_cache_cpu->freelist`，然后 `page->freelist` 会置空。page 的 frozen 状态设置为1，表示 slab 在本地 cpu 中缓存。
+
+```c
+struct page {
+           // 指向内存页中第一个空闲对象
+           void *freelist;     /* first free object */
+           // 该 slab 是否在对应 slab cache 的本地 CPU 缓存中，frozen = 1 表示缓存再本地 cpu 缓存中
+           unsigned frozen:1;
+}
+```
+
+`kmem_cache_cpu` 结构中的 tid 是内核为 slab cache 的 cpu 本地缓存结构设置的一个全局唯一的 transaction id ，这个 tid 在 slab cache 分配内存块的时候主要有两个作用：
+
+1. 内核会将 slab cache 每一次分配内存块或者释放内存块的过程视为一个事物，所以在每次向 slab cache 申请内存块或者将内存块释放回 slab cache 之后，内核都会改变这里的 tid。
+2. tid 也可以简单看做是 cpu 的一个编号，每个 cpu 的 tid 都不相同，可以用来标识区分不同 cpu 的本地缓存 `kmem_cache_cpu` 结构。
+
+其中 tid 的第二个作用是最主要的，因为进程可能在执行的过程中被更高优先级的进程抢占 cpu （开启 `CONFIG_PREEMPT` 允许内核抢占）或者被中断，随后进程可能会被内核重新调度到其他 cpu 上执行，这样一来，进程在被抢占之前获取到的 `kmem_cache_cpu` 就与当前执行进程 cpu 的 `kmem_cache_cpu` 不一致了。
+
+所以在内核中，我们经常会看到如下的代码片段，目的就是为了保证进程在 slab cache 中获取到的 cpu 本地缓存 `kmem_cache_cpu` 与当前执行进程的 cpu 是一致的。
+
+```c
+    do {
+        // 获取执行当前进程的 cpu 中的 tid 字段
+        tid = this_cpu_read(s->cpu_slab->tid);
+        // 获取 cpu 本地缓存 cpu_slab
+        c = raw_cpu_ptr(s->cpu_slab);
+        // 如果两者的 tid 字段不一致，说明进程已经被调度到其他 cpu 上了，需要再次获取正确的 cpu 本地缓存
+    } while (IS_ENABLED(CONFIG_PREEMPT) &&
+         unlikely(tid != READ_ONCE(c->tid)));
+```
+
+如果开启了 `CONFIG_SLUB_CPU_PARTIAL` 配置项，那么在 slab cache 的 cpu 本地缓存 `kmem_cache_cpu` 结构中就会多出一个 partial 列表，partial 列表中存放的都是 partial slub，相当于是 cpu 缓存的备用选择。当 `kmem_cache_cpu->page` （被本地 cpu 所缓存的 slab）中的对象已经全部分配出去之后，内核会到 partial 列表中查找一个 partial slab 出来，并从这个 partial slab 中分配一个对象出来，最后将 `kmem_cache_cpu->page` 指向这个 partial slab，作为新的 cpu 本地缓存 slab。这样一来，下次分配对象的时候，就可以直接从 cpu 本地缓存中获取了。
+
+![memory](./images/memory209.png)
+
+如果开启了 `CONFIG_SLUB_STATS` 配置项，内核就会记录一些关于 slab cache 的相关状态信息，这些信息同样也会在 `cat /proc/slabinfo` 命令中显示。
+
+slab cache 的架构涉及三种内核数据结构，分别是：
+
+- slab cache 在内核中的数据结构 `struct kmem_cache`
+- slab cache 的本地 cpu 缓存结构 `struct kmem_cache_cpu`
+- slab 在内核中的数据结构 `struct page`
+
+把这种三种数据结构结合起来，得到下面这副 slab cache 的架构图：
+
+![memory](./images/memory210.png)
+
+但这还不是 slab cache 的最终架构，假如把 slab cache 比作一个大型超市，超市里摆放了一排一排的商品货架，毫无疑问，顾客进入超市直接从货架上选取自己想要的商品速度是最快的。 `kmem_cache` 结构就好比是超市，slab cache 的本地 cpu 缓存结构 `kmem_cache_cpu` 就好比超市的营业厅，营业厅内摆满了一排一排的货架，这些货架就是上图中的 slab，货架上的商品就是 slab 中划分出来的一个一个的内存块。那么如果货架上的商品卖完了，该怎么办呢？这时，超市的经理就会到超市的仓库中重新拿取商品填充货架，那么 slab cache 的仓库到底在哪里呢？
+
+slab cache 的仓库就在 NUMA 节点中，而且在每一个 NUMA 节点中都有一个仓库，当 slab cache 本地 cpu 缓存 `kmem_cache_cpu` 中没有足够的内存块可供分配时，内核就会来到 NUMA 节点的仓库中拿出 slab 填充到 `kmem_cache_cpu` 中。那么 slab cache 在 NUMA 节点的仓库中也没有足够的货物了，那该怎么办呢？这时，内核就会到伙伴系统中重新批量申请一批 slabs，填充到本地 cpu 缓存 `kmem_cache_cpu` 结构中。伙伴系统就好比上面那个超市例子中的进货商，当超市经理发现仓库中也没有商品之后，就会联系进货商，从进货商那里批发商品，重新填充货架。slab cache 的仓库在内核中采用 `struct kmem_cache_node` 结构来表示：
+
+```c
+struct kmem_cache {
+    // slab cache 中 numa node 中的缓存，每个 node 一个
+    struct kmem_cache_node *node[MAX_NUMNODES];
+}
+/*
+ * The slab lists for all objects.
+ */
+struct kmem_cache_node {
+    spinlock_t list_lock;
+
+    // 省略 slab 相关字段
+
+#ifdef CONFIG_SLUB
+    // 该 node 节点中缓存的 slab 个数
+    unsigned long nr_partial;
+    // 该链表用于组织串联 node 节点中缓存的 slabs，partial 链表中缓存的 slab 为部分空闲的（slab 中的对象部分被分配出去）
+    struct list_head partial;
+#ifdef CONFIG_SLUB_DEBUG // 开启 slab_debug 之后会用到的字段
+    // slab 的个数
+    atomic_long_t nr_slabs;
+    // 该 node 节点中缓存的所有 slab 中包含的对象总和
+    atomic_long_t total_objects;
+    // full 链表中包含的 slab 全部是已经被分配完毕的 full slab
+    struct list_head full;
+#endif
+#endif
+};
+```
+
+如果配置了 `CONFIG_SLUB_DEBUG` 选项，那么 `kmem_cache_node` 结构中就会多出一些字段来存储更加丰富的信息。`nr_slabs` 表示 NUMA 节点缓存中 slabs 的总数，这里会包含 partial slub 和 full slab，这时，`nr_partial` 表示的是 partial slab 的个数，其中 full slab 会被串联在 full 列表上。`total_objects` 表示该 NUMA 节点缓存中缓存的对象的总数。
+
+slab cache 的架构全貌：
+
+![memory](./images/memory211.png)
+
+slab cache 本地 cpu 缓存 `kmem_cache_cpu` 中的 partial 列表以及 NUMA 节点缓存 `kmem_cache_node` 结构中的 partial 列表并不是无限制增长的，它们的容量收到下面两个参数的限制：
+
+```c
+/*
+ * Slab cache management.
+ */
+struct kmem_cache {
+
+    // slab cache 在 numa node 中缓存的 slab 个数上限，slab 个数超过该值，空闲的 empty slab 则会被回收至伙伴系统
+    unsigned long min_partial;
+
+#ifdef CONFIG_SLUB_CPU_PARTIAL
+    /* 限定 slab cache 在每个 cpu 本地缓存 partial 链表中所有 slab 中空闲对象的总数,
+     * cpu 本地缓存 partial 链表中空闲对象的数量超过该值，
+     * 则会将 cpu 本地缓存 partial 链表中的所有 slab 转移到 numa node 缓存中。
+     */
+    unsigned int cpu_partial;
+#endif
+};
+```
+
+#### slab 内存分配原理
+
+##### 从本地 cpu 缓存中直接分配
+
+![memory](./images/memory212.png)
+
+假设现在 slab cache 中的容量情况如上如图所示，slab cache 的本地 cpu 缓存中有一个 slab，slab 中有很多的空闲对象，`kmem_cache_cpu->page` 指向缓存的 slab，`kmem_cache_cpu->freelist` 指向缓存的 slab 中第一个空闲对象。当内核向该 slab cache 申请对象的时候，首先会进入快速分配路径 fastpath，通过 `kmem_cache_cpu->freelist` 直接查看本地 cpu 缓存 `kmem_cache_cpu->page` 中是否有空闲对象可供分配。如果有，则将 `kmem_cache_cpu->freelist` 指向的第一个空闲对象拿出来分配，随后调整 `kmem_cache_cpu->freelist` 指向下一个空闲对象。
+
+![memory](./images/memory213.png)
+
+##### 从本地 cpu 缓存 partial 列表中分配
+
+![memory](./images/memory214.png)
+
+当 slab cache 本地 cpu 缓存的 slab (`kmem_cache_cpu->page`) 中没有任何空闲的对象时（全部被分配出去了），那么 slab cache 的内存分配就会进入慢速路径 slowpath。内核会到本地 cpu 缓存的 partial 列表中去查看是否有一个 slab 可以分配对象。这里内核会从 partial 列表中的头结点开始遍历直到找到一个可以满足分配的 slab 出来。随后内核会将该 slab 从 partial 列表中摘下，直接提升为新的本地 cpu 缓存。
+
+![memory](./images/memory215.png)
+
+这样一来 slab cache 的本地 cpu 缓存就被更新了，内核通过 `kmem_cache_cpu->freelist` 指针将缓存 slab 中的第一个空闲对象分配出去，随后更新 `kmem_cache_cpu->freelist` 指向 slab 中的下一个空闲对象。
+
+![memory](./images/memory216.png)
+
+##### 从 NUMA 节点缓存中分配
+
+![memory](./images/memory217.png)
+
+随着时间的推移， slab cache 本地 cpu 缓存的 slab 中的对象被一个一个的分配出去，变成了一个 full slab，于此同时本地 cpu 缓存 partial 链表中的 slab 也被全部摘除完毕，此时是一个空的链表。那么在这种情况下，slab cache 如何分配内存呢？此时 slab cache 就该从仓库中拿 slab 了，这个仓库就是上图中的 `kmem_cache_node` 结构中的 partial 链表。内核会从 `kmem_cache_node->partial` 链表的头结点开始遍历，将遍历到的第一个 slab 从链表中摘下，直接提升为新的本地 cpu 缓存 `kmem_cache_cpu->page`， `kmem_cache_cpu->freelist` 指针重新指向该 slab 中第一个空闲独享。
+
+![memory](./images/memory218.png)
+
+随后内核会接着遍历 `kmem_cache_node->partial` 链表，将链表中的 slab 挨个摘下填充到本地 cpu 缓存 partial 链表中。最多只能填充 `cpu_partial / 2` 个 slab。
+
+![memory](./images/memory219.png)
+
+这样一来，slab cache 就从仓库 `kmem_cache_node->partial` 链表中重新填充了本地 cpu 缓存 `kmem_cache_cpu->page` 以及 `kmem_cache_cpu->partial` 链表。随后内核直接从本地 cpu 缓存中，通过 `kmem_cache_cpu->freelist` 指针将缓存 slab 中的第一个空闲对象分配出去，随后更新 `kmem_cache_cpu->freelist` 指向 slab 中的下一个空闲对象。
+
+![memory](./images/memory220.png)
+
+##### 从伙伴系统中重新申请 slab
+
+![memory](./images/memory221.png)
+
+当 slab cache 的本地 cpu 缓存 `kmem_cache_cpu->page` 是空的，`kmem_cache_cpu->partial` 链表中也是空，NUMA 节点缓存 `kmem_cache_node->partial` 链表中也是空的时候，比如，slab cache 在刚刚被创建出来时，就是上图中的架构，完全是一个空的 slab cache。这时，内核就需要到伙伴系统中重新申请一个 slab 出来，具体向伙伴系统申请多少内存页是由 `struct kmem_cache` 结构中的 `oo` 来决定的，它的高 16 位表示一个 slab 所需要的内存页个数，低 16 位表示 slab 中所包含的对象总数。当系统中空闲内存不足时，无法获得 `oo` 指定的内存页个数，那么内核会降级采用 `min` 指定的内存页个数，重新到伙伴系统中去申请。当内核从伙伴系统中申请出指定的内存页个数之后，初始化 slab ，最后将初始化好的 slab 直接提升为本地 cpu 缓存 `kmem_cache_cpu->page` 。
+
+![memory](./images/memory222.png)
+
+现在 slab cache 的本地 cpu 缓存被重新填充了，内核直接从本地 cpu 缓存中，通过 `kmem_cache_cpu->freelist` 指针将缓存 slab 中的第一个空闲对象分配出去，随后更新 `kmem_cache_cpu->freelist` 指向 slab 中的下一个空闲对象。
+
+![memory](./images/memory223.png)
+
+#### slab 内存释放原理
+
+##### 释放对象所属 slab 在 cpu 本地缓存中
+
+![memory](./images/memory224.png)
+
+如果将要释放回 slab cache 的对象所在的 slab 刚好是本地 cpu 缓存中缓存的 slab，那么内核直接会把对象释放回缓存的 slab 中，这个就是 slab cache 的快速内存释放路径 fastpath。随后修正 `kmem_cache_cpu->freelist` 指针使其指向刚刚被释放的对象，释放对象的 freepointer 指针指向原来 `kmem_cache_cpu->freelist` 指向的对象。
+
+![memory](./images/memory225.png)
+
+##### 释放对象所属 slab 在 cpu 本地缓存 partial 列表中
+
+![memory](./images/memory226.png)
+
+当释放的对象所属的 slab 在 cpu 本地缓存 `kmem_cache_cpu->partial` 链表中时，内核也是直接将对象释放回 slab 中，然后修改 slab （`struct page`）中的 freelist 指针指向刚刚被释放的对象。释放对象的 freepointer 指向其下一个空闲对象。
+
+![memory](./images/memory227.png)
+
+##### 释放对象所属 slab 从 full slab 变为了 partial slab
+
+当前释放对象所在的 slab 原来是一个 full slab，由于对象的释放刚好变成了一个 partial slab，并且该 slab 原来并不在 slab cache 的本地 cpu 缓存中。
+
+![memory](./images/memory228.png)
+
+这种情况下，当对象释放回 slab 之后，内核为了利用局部性的优势需要把该 slab 在插入到 slab cache 的本地 cpu 缓存 `kmem_cache_cpu->partial` 链表中。因为 slab 之前之所以是一个 full slab，恰恰证明了该 slab 是一个非常活跃的 slab，常常供不应求导致变成了一个 full slab，当对象释放之后，刚好变成 partial slab，这时需要将这个被频繁访问的 slab 放入 cpu 缓存中，加快下次分配对象的速度。
+
+![memory](./images/memory229.png)
+
+以上只是 slab 被释放回 `kmem_cache_cpu->partial` 链表的正常流程，slab cache 的本地 cpu 缓存 `kmem_cache_cpu->partial` 链表中的容量不可能是无限制增长的，它受到 `kmem_cache` 结构中 `cpu_partial` 属性的限制
+
+![memory](./images/memory230.png)
+
+当每次向 `kmem_cache_cpu->partial` 链表中填充 slab 的时候，内核都需要首先检查当前 `kmem_cache_cpu->partial` 链表中所有 slabs 所包含的空闲对象总数是否超过了 `cpu_partial` 的限制。如果没有超过限制，则将 slab 插入到 `kmem_cache_cpu->partial` 链表的头部，如果超过了限制，则需要首先将当前 `kmem_cache_cpu->partial` 链表中的所有 slab 转移至对应的 NUMA 节点缓存 `kmem_cache_node->partial` 链表的尾部，然后才能将释放对象所在的 slab 插入到 `kmem_cache_cpu->partial` 链表中。
+
+![memory](./images/memory231.png)
+
+内核这里为什么要把 `kmem_cache_cpu->partial` 链表中的 slab 一次性全部移动到 `kmem_cache_node->partial` 链表中呢？这样一来如果在 slab cache 的本地 cpu 缓存不够的情况下，不是还要从 `kmem_cache_node->partial` 链表中再次转移 slab 填充 `kmem_cache_cpu` 吗？其实做任何设计都是要考虑当前场景的，当 slab cache 演进到如上图所示的架构时，说明内核当前所处的场景是一个内存释放频繁的场景，由于内存频繁的释放，所以导致 `kmem_cache_cpu->partial` 链表中的空闲对象都快被填满了，已经超过了 `cpu_partial` 的限制。所以在内存频繁释放的场景下，`kmem_cache_cpu->partial` 链表太满了，而内存分配的请求又不是很多，`kmem_cache_cpu` 中缓存的 slab 并不会频繁的消耗。这样一来，就需要将链表中的所有 slab 一次性转移到 NUMA 节点缓存 partial 链表中备用。否则的话，就得频繁的转移 slab，这样性能消耗更大。但是当前释放对象所在的 slab 仍然会被添加到 `kmem_cache_cpu->partial` 表中，用以应对不那么频繁的内存分配需求。
+
+##### 释放对象所属 slab 从 partial slab 变为了 empty slab
+
+如果释放对象所属的 slab 原来是一个 partial slab，在对象释放之后变成了一个 empty slab，在这种情况下，内核将会把该 slab 插入到 slab cache 的备用仓库 NUMA 节点缓存中。因为 slab 之所以会变成 empty slab，表明该 slab 并不是一个活跃的 slab，内核已经好久没有从该 slab 中分配对象了，所以只能把它释放回 `kmem_cache_node->partial` 链表中作为本地 cpu 缓存的后备选项。
+
+![memory](./images/memory232.png)
+
+但是 `kmem_cache_node->partial` 链表中的 slab 不可能是无限增长的，链表中缓存的 slab 个数受到 `kmem_cache` 结构中 `min_partial` 属性的限制。所以内核在将 slab 插入到 `kmem_cache_node->partial` 链表之前，需要检查当前 `kmem_cache_node->partial` 链表中缓存的 slab 个数 `nr_partial` 是否已经超过了 `min_partial` 的限制。如果超过了限制，则直接将 slab 释放回伙伴系统中，如果没有超过限制，才会将 slab 插入到 `kmem_cache_node->partial` 链表中。
+
+![memory](./images/memory233.png)
+
+还有一种直接释放回 `kmem_cache_node->partial` 链表的情形是，释放对象所属的 slab 本来就在 `kmem_cache_node->partial` 链表中，这种情况下就是直接释放对象回 slab 中，无需改变 slab 的位置。
+
+![memory](./images/memory234.png)
+
+#### kmem_cache_create
+
+![memory](./images/memory235.png)
+
+```c
+struct kmem_cache *
+kmem_cache_create(const char *name, unsigned int size, unsigned int align,
+        slab_flags_t flags, void (*ctor)(void *))
+{
+    return kmem_cache_create_usercopy(name, size, align, flags, 0, 0,
+                      ctor);
+}
+```
+
+内核提供 `kmem_cache_create_usercopy` 函数的目的其实是为了防止 slab cache 中管理的内核核心对象被泄露，通过 useroffset 和 usersize 两个变量来指定内核对象内存布局区域中 useroffset 到 usersize 的这段内存区域可以被复制到用户空间中，其他区域则不可以。在 Linux 内核初始化的过程中会提前为内核核心对象创建好对应的 slab cache，比如：在内核初始化函数 `start_kernel` 中调用 `fork_init` 函数为 `struct task_struct` 创建其所属的 slab cache —— `task_struct_cachep`。在 `fork_init` 中就调用了 `kmem_cache_create_usercopy` 函数来创建 `task_struct_cachep`，同时指定 `task_struct` 对象中 useroffset 到 usersize 这段内存区域可以被复制到用户空间。例如：通过 ptrace 系统调用访问进程的 task_struct 结构时，只能访问 task_struct 对象 useroffset 到 usersize 的这段区域。
+
+```c
+void __init fork_init(void)
+{
+    ......
+    unsigned long useroffset, usersize;
+
+    /* create a slab on which task_structs can be allocated */
+    task_struct_whitelist(&useroffset, &usersize);
+    task_struct_cachep = kmem_cache_create_usercopy("task_struct",
+            arch_task_struct_size, align,
+            SLAB_PANIC|SLAB_ACCOUNT,
+            useroffset, usersize, NULL);
+            
+    ......
+}
+
+struct kmem_cache *
+kmem_cache_create_usercopy(const char *name,
+          unsigned int size, unsigned int align,
+          slab_flags_t flags,
+          unsigned int useroffset, unsigned int usersize,
+          void (*ctor)(void *))
+{
+    struct kmem_cache *s = NULL;
+    const char *cache_name;
+    int err;
+
+    // 获取 cpu_hotplug_lock，防止 cpu 热插拔改变 online cpu map
+    get_online_cpus();
+    // 获取 mem_hotplug_lock，防止访问内存的时候进行内存热插拔
+    get_online_mems();
+    // memory cgroup 相关，获取 memcg_cache_ids_sem 读写信号量，防止 memcg_nr_cache_ids （caches array 大小）被修改
+    memcg_get_cache_ids();
+    // 获取 slab cache 链表的全局互斥锁
+    mutex_lock(&slab_mutex);
+
+    // 入参检查，校验 name 和 size 的有效性，防止创建过程在中断上下文中进行
+    err = kmem_cache_sanity_check(name, size);
+    if (err) {
+        goto out_unlock;
+    }
+
+    // 检查有效的 slab flags 标记位，如果传入的 flag 是无效的，则拒绝本次创建请求
+    if (flags & ~SLAB_FLAGS_PERMITTED) {
+        err = -EINVAL;
+        goto out_unlock;
+    }
+
+    // 设置创建 slab  cache 时用到的一些标志位
+    flags &= CACHE_CREATE_MASK;
+
+    // 校验 useroffset 和 usersize 的有效性
+    if (WARN_ON(!usersize && useroffset) ||
+        WARN_ON(size < usersize || size - usersize < useroffset))
+        usersize = useroffset = 0;
+
+    if (!usersize)
+        /* 在全局 slab cache 链表中查找与当前创建参数相匹配的 kmem_cache
+         * 如果有，就不需要创建新的了，直接和已有的 slab cache 合并
+         * 并且在 sys 文件系统中使用指定的 name 作为已有  slab cache  的别名
+         */
+        s = __kmem_cache_alias(name, size, align, flags, ctor);
+    if (s)
+        goto out_unlock;
+    /* 在内核中为指定的 name 生成字符串常量并分配内存
+     * 这里的 cache_name 就是将要创建的 slab cache 名称，用于在 /proc/slabinfo 中显示
+     */
+    cache_name = kstrdup_const(name, GFP_KERNEL);
+    if (!cache_name) {
+        err = -ENOMEM;
+        goto out_unlock;
+    }
+    // 按照指定的参数，创建新的 slab cache
+    s = create_cache(cache_name, size,
+             calculate_alignment(flags, align, size),
+             flags, useroffset, usersize, ctor, NULL, NULL);
+    if (IS_ERR(s)) {
+        err = PTR_ERR(s);
+        kfree_const(cache_name);
+    }
+
+out_unlock:
+    // 走到这里表示创建 slab cache 失败，释放相关的自旋锁和信号量
+    mutex_unlock(&slab_mutex);
+    memcg_put_cache_ids();
+    put_online_mems();
+    put_online_cpus();
+
+    if (err) {
+        if (flags & SLAB_PANIC)
+            panic("kmem_cache_create: Failed to create slab '%s'. Error %d\n",
+                name, err);
+        else {
+            pr_warn("kmem_cache_create(%s) failed with error %d\n",
+                name, err);
+            dump_stack();
+        }
+        return NULL;
+    }
+    return s;
+}
+```
+
+![memory](./images/memory236.png)
+
+##### __kmem_cache_alias
+
+`__kmem_cache_alias` 函数的核心是在 `find_mergeable` 方法中，内核在 `find_mergeable` 方法里边会遍历 slab cache 的全局链表 list，查找与当前创建参数贴近可以被复用的 slab cache。
+
+一个可以被复用的 slab cache 需要满足以下四个条件：
+
+1. 指定的 slab_flags_t 相同。
+2. 指定对象的 object size 要小于等于已有 slab cache 中的对象 size （`kmem_cache->size`）。
+3. 如果指定对象的 object size 与已有 `kmem_cache->size` 不相同，那么它们之间的差值需要再一个 word size 之内。
+4. 已有 slab cache 中的 slab 对象对齐 align （`kmem_cache->align`）要大于等于指定的 align 并且可以整除 align 。
+
+```c
+struct kmem_cache *
+__kmem_cache_alias(const char *name, unsigned int size, unsigned int align,
+           slab_flags_t flags, void (*ctor)(void *))
+{
+    struct kmem_cache *s, *c;
+    /* 在全局 slab cache 链表中查找与当前创建参数相匹配的 slab cache
+     * 如果在全局查找到一个 slab cache，它的核心参数和指定的创建参数很贴近
+     * 那么就没必要再创建新的 slab cache了，复用已有的 slab cache
+     */
+    s = find_mergeable(size, align, flags, name, ctor);
+    if (s) {
+        // 如果存在可复用的 kmem_cache，则将它的引用计数 + 1
+        s->refcount++;
+        // 采用较大的值，更新已有的 kmem_cache 相关的元数据
+        s->object_size = max(s->object_size, size);
+        s->inuse = max(s->inuse, ALIGN(size, sizeof(void *)));
+        // 遍历 mem cgroup 中的 cache array，更新对应的元数据
+        for_each_memcg_cache(c, s) {
+            c->object_size = s->object_size;
+            c->inuse = max(c->inuse, ALIGN(size, sizeof(void *)));
+        }
+        /* 由于这里会复用已有的 kmem_cache 并不会创建新的，而且指定的 kmem_cache 名称是 name。
+         * 为了看起来像是创建了一个名称为 name 的新 kmem_cache，所以要给被复用的 kmem_cache 起一个别名，
+         * 这个别名就是指定的 name。在 sys 文件系统中使用指定的 name 为被复用 kmem_cache 创建别名
+         * 这样一来就会在 sys 文件系统中出现一个这样的目录 /sys/kernel/slab/name ，
+         * 该目录下的文件包含了对应 slab cache 运行时的详细信息
+         */
+        if (sysfs_slab_alias(s, name)) {
+            s->refcount--;
+            s = NULL;
+        }
+    }
+
+    return s;
+}
+```
+
+如果通过 `find_mergeable` 在现有系统中所有 slab cache 中找到了一个可以复用的 slab cache，那么就不需要在创建新的了，直接返回已有的 slab cache 就可以了。
+
+系统中的所有 slab cache 都会在 sys 文件系统中有一个专门的目录：`/sys/kernel/slab/<cachename>`，该目录下的所有文件都是 read only 的，每一个文件代表 slab cache 的一项运行时信息，比如：
+
+- `/sys/kernel/slab/<cachename>/align` 文件标识该 slab cache 中的 slab 对象的对齐 align
+- `/sys/kernel/slab/<cachename>/alloc_fastpath` 文件记录该 slab cache 在快速路径下分配的对象个数
+- `/sys/kernel/slab/<cachename>/alloc_from_partial` 文件记录该 slab cache 从本地 cpu 缓存 partial 链表中分配的对象次数
+- `/sys/kernel/slab/<cachename>/alloc_slab` 文件记录该 slab cache 从伙伴系统中申请新 slab 的次数
+- `/sys/kernel/slab/<cachename>/cpu_slabs` 文件记录该 slab cache 的本地 cpu 缓存中缓存的 slab 个数
+- `/sys/kernel/slab/<cachename>/partial` 文件记录该 slab cache 在每个 NUMA 节点缓存 partial 链表中的 slab 个数
+- `/sys/kernel/slab/<cachename>/objs_per_slab` 文件记录该 slab cache 中管理的 slab 可以容纳多少个对象。
+
+该目录下还有很多文件笔者就不一一列举了， `/sys/kernel/slab/<cachename>` 目录下的文件描述了对应 slab cache 非常详细的运行信息。由于并没有真正创建一个新的 slab cache，而是复用系统中已有的 slab cache，但是内核需要让用户感觉上已经按照指定的创建参数创建了一个新的 slab cache，所以需要为创建的 slab cache 也单独在 sys 文件系统中创建一个 `/sys/kernel/slab/name` 目录，但是该目录下的文件需要**软链接**到原有 slab cache 在 sys 文件系统对应目录下的文件。这就相当于给原有 slab cache 起了一个别名，这个别名就是指定的 name，但是 `/sys/kernel/slab/name` 目录下的文件还是用的原有 slab cache 的。可以通过 `/sys/kernel/slab/<cachename>/aliases` 文件查看该 slab cache 的所有别名个数，也就是说有多少个 slab cache 复用了该 slab cache 。
+
+```objectivec
+struct kmem_cache *find_mergeable(unsigned int size, unsigned int align,
+        slab_flags_t flags, const char *name, void (*ctor)(void *))
+{
+    struct kmem_cache *s;
+    // 与 word size 进行对齐
+    size = ALIGN(size, sizeof(void *));
+    // 根据指定的对齐参数 align 并结合 CPU cache line 大小，计算出一个合适的对齐参数
+    align = calculate_alignment(flags, align, size);
+    // 对象 size 重新按照 align 进行对齐
+    size = ALIGN(size, align);
+
+    // 如果 flag 设置的是不允许合并，则停止
+    if (flags & SLAB_NEVER_MERGE)
+        return NULL;
+
+    // 开始遍历内核中已有的 slab cache，寻找可以合并的 slab cache
+    list_for_each_entry_reverse(s, &slab_root_caches, root_caches_node) {
+        if (slab_unmergeable(s))
+            continue;
+        // 指定对象 size 不能超过已有 slab cache 中的对象 size
+        if (size > s->size)
+            continue;
+        // 校验指定的 flag 是否与已有 slab cache 中的 flag 一致
+        if ((flags & SLAB_MERGE_SAME) != (s->flags & SLAB_MERGE_SAME))
+            continue;
+        // 两者的 size 相差在一个 word size 之内 
+        if (s->size - size >= sizeof(void *))
+            continue;
+        // 已有 slab cache 中对象的对齐 align 要大于等于指定的 align 并且可以整除 align。
+        if (IS_ENABLED(CONFIG_SLAB) && align &&
+            (align > s->align || s->align % align))
+            continue;
+        // 查找到可以合并的已有 slab cache，不需要再创建新的 slab cache 了
+        return s;
+    }
+    return NULL;
+}
+
+static unsigned int calculate_alignment(slab_flags_t flags,
+        unsigned int align, unsigned int size)
+{
+    // SLAB_HWCACHE_ALIGN 表示需要按照硬件 cache line 对齐
+    if (flags & SLAB_HWCACHE_ALIGN) {
+        unsigned int ralign;
+        // 获取 cache line 大小 通常为 64 字节
+        ralign = cache_line_size();
+        // 根据指定对齐参数 align ，对象 object size 以及 cache line 大小，综合计算出一个合适的对齐参数 ralign 出来
+        while (size <= ralign / 2)
+            ralign /= 2;
+        align = max(align, ralign);
+    }
+
+    // ARCH_SLAB_MINALIGN 为 slab 设置的最小对齐参数， 8 字节大小，align 不能小于该值
+    if (align < ARCH_SLAB_MINALIGN)
+        align = ARCH_SLAB_MINALIGN;
+    // 与 word size 进行对齐
+    return ALIGN(align, sizeof(void *));
+}
+```
+
+##### create_cache
+
+```c
+static struct kmem_cache *create_cache(const char *name,
+        unsigned int object_size, unsigned int align,
+        slab_flags_t flags, unsigned int useroffset,
+        unsigned int usersize, void (*ctor)(void *),
+        struct mem_cgroup *memcg, struct kmem_cache *root_cache)
+{
+    struct kmem_cache *s;
+    /* 为将要创建的 slab cache 分配 kmem_cache 结构
+     * kmem_cache 也是内核的一个核心数据结构，同样也会被它对应的 slab cache 所管理
+     * 这里就是从 kmem_cache 所属的 slab cache 中拿出一个 kmem_cache 对象出来
+     */
+    s = kmem_cache_zalloc(kmem_cache, GFP_KERNEL);
+
+    // 利用指定的创建参数初始化 kmem_cache 结构
+    s->name = name;
+    s->size = s->object_size = object_size;
+    s->align = align;
+    s->ctor = ctor;
+    s->useroffset = useroffset;
+    s->usersize = usersize;
+    /* 创建 slab cache 的核心函数，这里会初始化 kmem_cache 结构中的其他重要属性
+     * 包括创建初始化 kmem_cache_cpu 和 kmem_cache_node 结构
+     */
+    err = __kmem_cache_create(s, flags);
+    if (err)
+        goto out_free_cache;
+    // slab cache 初始状态下，引用计数为 1
+    s->refcount = 1;
+    // 将刚刚创建出来的 slab cache 加入到 slab cache 在内核中的全局链表管理
+    list_add(&s->list, &slab_caches);
+
+out:
+    if (err)
+        return ERR_PTR(err);
+    return s;
+
+out_free_cache:
+    // 创建过程出现错误之后，释放 kmem_cache 对象
+    kmem_cache_free(kmem_cache, s);
+    goto out;
+}
+```
+
+slab cache 的数据结构 `struct kmem_cache` 属于内核的核心数据结构，有其专属的 slab cache 来专门管理 `kmem_cache` 对象的分配与释放。内核在启动阶段，会专门为 `struct kmem_cache` 创建其专属的 slab cache，保存在全局变量 `kmem_cache` 中。
+
+```c
+// 全局变量，用于专门管理 kmem_cache 对象的 slab cache，定义在文件：/mm/slab_common.c
+struct kmem_cache *kmem_cache;
+```
+
+同理，slab cache 的 NUMA 节点缓存 `kmem_cache_node` 结构也是如此，内核也会为其创建一个专属的 slab cache，保存在全局变量 `kmem_cache_node` 中。
+
+```c
+// 全局变量，用于专门管理 kmem_cache_node 对象的 slab cache，定义在文件：/mm/slub.c
+static struct kmem_cache *kmem_cache_node;
+```
+
+```c
+int __kmem_cache_create(struct kmem_cache *s, slab_flags_t flags)
+{
+    int err;
+    // 核心函数，在这里会初始化 kmem_cache 的其他重要属性
+    err = kmem_cache_open(s, flags);
+    if (err)
+        return err;
+
+    /* 检查内核中 slab 分配器的整体体系是否已经初始化完毕，只有状态是 FULL 的时候才是初始化完毕，其他的状态表示未初始化完毕。
+     * 在 slab  allocator 体系初始化的时候在 slab_sysfs_init 函数中将 slab_state 设置为 FULL
+     */
+    if (slab_state <= UP)
+        return 0;
+    // 在 sys 文件系统中创建 /sys/kernel/slab/name 节点，该目录下的文件包含了对应 slab cache 运行时的详细信息
+    err = sysfs_slab_add(s);
+    if (err)
+        // 出现错误则释放 kmem_cache 结构
+        __kmem_cache_release(s);
+
+    return err;
+}
+
+// slab allocator 整个体系的状态 slab_state。
+enum slab_state {
+    DOWN,           /* No slab functionality yet */
+    PARTIAL,        /* SLUB: kmem_cache_node available */
+    UP,             /* Slab caches usable but not all extras yet */
+    FULL            /* Everything is working */
+};
+
+__initcall(slab_sysfs_init);
+
+static int __init slab_sysfs_init(void)
+{
+    struct kmem_cache *s;
+    int err;
+
+    mutex_lock(&slab_mutex);
+
+    slab_kset = kset_create_and_add("slab", &slab_uevent_ops, kernel_kobj);
+    if (!slab_kset) {
+        mutex_unlock(&slab_mutex);
+        pr_err("Cannot register slab subsystem.\n");
+        return -ENOSYS;
+    }
+
+    slab_state = FULL;
+    
+    .......
+
+}
+```
+
+###### kmem_cache_open
+
+```c
+static int kmem_cache_open(struct kmem_cache *s, slab_flags_t flags)
+{
+    /* 计算 slab 中对象的整体内存布局所需要的 size，slab 所需最合适的内存页面大小 order，slab 中所能容纳的对象个数
+     * 初始化 slab cache 中的核心参数 oo ,min,max的值
+     */
+    if (!calculate_sizes(s, -1))
+        goto error;
+
+    // 设置 slab cache 在 node 缓存  kmem_cache_node 中的 partial 列表中 slab 的最小个数 min_partial
+    set_min_partial(s, ilog2(s->size) / 2);
+    // 设置 slab cache 在 cpu 本地缓存的 partial 列表中所能容纳的最大空闲对象个数
+    set_cpu_partial(s);
+
+    // 为 slab cache 创建并初始化 node cache 数组
+    if (!init_kmem_cache_nodes(s))
+        goto error;
+    // 为 slab cache 创建并初始化 cpu 本地缓存列表
+    if (alloc_kmem_cache_cpus(s))
+        return 0;
+}
+```
+
+
+
+### vmalloc
+
+vmalloc 内存分配接口在 vmalloc 映射区申请内存的时候，首先也会在 32T 大小的 vmalloc 映射区中划分出一段未被使用的虚拟内存区域出来，暂且叫这段虚拟内存区域为 vmalloc 区，和 mmap 非常相似。只不过 mmap 工作在用户空间的文件与匿名映射区，vmalloc 工作在内核空间的 vmalloc 映射区。内核空间中的 vmalloc 映射区就是由这样一段一段的 vmalloc 区组成的，每调用一次 vmalloc 内存分配接口，就会在 vmalloc 映射区中映射出一段 vmalloc 虚拟内存区域，而且每个 vmalloc 区之间隔着一个 4K 大小的 guard page（虚拟内存），用于防止内存越界，将这些非连续的物理内存区域隔离起来。和 mmap 不同的是，vmalloc 在分配完虚拟内存之后，会马上为这段虚拟内存分配物理内存，内核会首先计算出由 vmalloc 内存分配接口映射出的这一段虚拟内存区域 vmalloc 区中包含的虚拟内存页数，然后调用伙伴系统依次为这些虚拟内存页分配物理内存页。
+
+![memory](./images/memory161.png)
+
+```c
+/**
+ * vmalloc - allocate virtually contiguous memory
+ * @size:    allocation size
+ *
+ * Allocate enough pages to cover @size from the page level
+ * allocator and map them into contiguous kernel virtual space.
+ *
+ * For tight control over page level allocator and protection flags
+ * use __vmalloc() instead.
+ *
+ * Return: pointer to the allocated memory or %NULL on error
+ */
+void *vmalloc(unsigned long size)
+{
+	return __vmalloc_node(size, 1, GFP_KERNEL, NUMA_NO_NODE,
+				__builtin_return_address(0));
+}
+EXPORT_SYMBOL(vmalloc);
+
+/**
+ * __vmalloc_node - allocate virtually contiguous memory
+ * @size:	    allocation size
+ * @align:	    desired alignment
+ * @gfp_mask:	    flags for the page level allocator
+ * @node:	    node to use for allocation or NUMA_NO_NODE
+ * @caller:	    caller's return address
+ *
+ * Allocate enough pages to cover @size from the page level allocator with
+ * @gfp_mask flags.  Map them into contiguous kernel virtual space.
+ *
+ * Reclaim modifiers in @gfp_mask - __GFP_NORETRY, __GFP_RETRY_MAYFAIL
+ * and __GFP_NOFAIL are not supported
+ *
+ * Any use of gfp flags outside of GFP_KERNEL should be consulted
+ * with mm people.
+ *
+ * Return: pointer to the allocated memory or %NULL on error
+ */
+void *__vmalloc_node(unsigned long size, unsigned long align,
+			    gfp_t gfp_mask, int node, const void *caller)
+{
+	return __vmalloc_node_range(size, align, VMALLOC_START, VMALLOC_END,
+				gfp_mask, PAGE_KERNEL, 0, node, caller);
+}
+
+/**
+ * __vmalloc_node_range - allocate virtually contiguous memory
+ * Allocate enough pages to cover @size from the page level
+ * allocator with @gfp_mask flags.  Map them into contiguous
+ * kernel virtual space, using a pagetable protection of @prot.
+ *
+ * Return: the address of the area or %NULL on failure
+ */
+void *__vmalloc_node_range(unsigned long size, unsigned long align,
+            unsigned long start, unsigned long end, gfp_t gfp_mask,
+            pgprot_t prot, unsigned long vm_flags, int node,
+            const void *caller)
+{
+    // 用于描述 vmalloc 虚拟内存区域的数据结构，同 mmap 中的 vma 结构很相似
+    struct vm_struct *area;
+    // vmalloc 虚拟内存区域的起始地址
+    void *addr;
+    unsigned long real_size = size;
+    // size 为要申请的 vmalloc 虚拟内存区域大小，这里需要按页对齐
+    size = PAGE_ALIGN(size);
+    // 因为在分配完 vmalloc 区之后，马上就会为其分配物理内存，所以这里需要检查 size 大小不能超过当前系统中的空闲物理内存
+    if (!size || (size >> PAGE_SHIFT) > totalram_pages())
+        goto fail;
+
+    // 在内核空间的 vmalloc 动态映射区中，划分出一段空闲的虚拟内存区域 vmalloc 区出来
+    area = __get_vm_area_node(size, align, VM_ALLOC | VM_UNINITIALIZED |
+                vm_flags, start, end, node, gfp_mask, caller);
+    if (!area)
+        goto fail;
+    // 为 vmalloc 虚拟内存区域中的每一个虚拟内存页分配物理内存页，并在内核页表中将 vmalloc 区与物理内存映射起来
+    addr = __vmalloc_area_node(area, gfp_mask, prot, node);
+    if (!addr)
+        return NULL;
+
+    return addr;
+}
+
+// 用来描述 vmalloc 区
+struct vm_struct {
+    // vmalloc 动态映射区中的所有虚拟内存区域也都是被一个单向链表所串联
+    struct vm_struct    *next;
+    // vmalloc 区的起始内存地址
+    void            *addr;
+    // vmalloc 区的大小
+    unsigned long       size;
+    /* vmalloc 区的相关标记
+     * VM_ALLOC 表示该区域是由 vmalloc 函数映射出来的
+     * VM_MAP 表示该区域是由 vmap 函数映射出来的
+     * VM_IOREMAP 表示该区域是由 ioremap 函数将硬件设备的内存映射过来的
+     */
+    unsigned long       flags;
+    // struct page 结构的数组指针，数组中的每一项指向该虚拟内存区域背后映射的物理内存页。
+    struct page     **pages;
+    // 该虚拟内存区域包含的物理内存页个数
+    unsigned int        nr_pages;
+    // ioremap 映射硬件设备物理内存的时候填充
+    phys_addr_t     phys_addr;
+    // 调用者的返回地址（这里可忽略）
+    const void      *caller;
+};
+```
+
+![memory](./images/memory162.png)
+
+在内核中所有的这些 vm_struct 均是被一个单链表串联组织的，在早期的内核版本中就是通过遍历这个单向链表来在 vmalloc 动态映射区中寻找空闲的虚拟内存区域的，后来为了提高查找效率引入了红黑树以及双向链表来重新组织这些 vmalloc 区域，于是专门引入了一个 `vmap_area` 结构来描述 vmalloc 区域的组织形式。
+
+```c
+struct vmap_area {
+    // vmalloc 区的起始内存地址
+    unsigned long va_start;
+    // vmalloc 区的结束内存地址
+    unsigned long va_end;
+    // vmalloc 区所在红黑树中的节点
+    struct rb_node rb_node;         /* address sorted rbtree */
+    // vmalloc 区所在双向链表中的节点
+    struct list_head list;          /* address sorted list */
+    // 用于关联 vm_struct 结构
+    struct vm_struct *vm;          
+};
+```
+
+![memory](./images/memory163.png)
+
+```c
+static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+                 pgprot_t prot, int node)
+{
+    // 指向即将为 vmalloc 区分配的物理内存页
+    struct page **pages;
+    unsigned int nr_pages, array_size, i;
+
+    // 计算 vmalloc 区所需要的虚拟内存页个数
+    nr_pages = get_vm_area_size(area) >> PAGE_SHIFT;
+    // vm_struct 结构中的 pages 数组大小，用于存放指向每个物理内存页的指针
+    array_size = (nr_pages * sizeof(struct page *));
+
+    // 首先要为 pages 数组分配内存
+    if (array_size > PAGE_SIZE) {
+        // array_size 超过 PAGE_SIZE 大小则递归调用 vmalloc 分配数组所需内存
+        pages = __vmalloc_node(array_size, 1, nested_gfp|highmem_mask,
+                PAGE_KERNEL, node, area->caller);
+    } else {
+        // 直接调用 kmalloc 分配数组所需内存
+        pages = kmalloc_node(array_size, nested_gfp, node);
+    }
+
+    // 初始化 vm_struct
+    area->pages = pages;
+    area->nr_pages = nr_pages;
+
+    // 依次为 vmalloc 区中包含的所有虚拟内存页分配物理内存
+    for (i = 0; i < area->nr_pages; i++) {
+        struct page *page;
+
+        if (node == NUMA_NO_NODE)
+            // 如果没有特殊指定 numa node，则从当前 numa node 中分配物理内存页
+            page = alloc_page(alloc_mask|highmem_mask);
+        else
+            // 否则就从指定的 numa node 中分配物理内存页
+            page = alloc_pages_node(node, alloc_mask|highmem_mask, 0);
+        // 将分配的物理内存页依次存放到 vm_struct 结构中的 pages 数组中
+        area->pages[i] = page;
+    }
+    
+    atomic_long_add(area->nr_pages, &nr_vmalloc_pages);
+    // 修改内核主页表，将刚刚分配出来的所有物理内存页与 vmalloc 虚拟内存区域进行映射
+    if (map_vm_area(area, prot, pages))
+        goto fail;
+    // 返回 vmalloc 虚拟内存区域起始地址
+    return area->addr;
+}
+```
+
+![memory](./images/memory164.png)
+
+当内核通过 vmalloc 内存分配接口修改完内核主页表之后，主页表中的相关页目录项以及页表项的内容就发生了改变，但进程无法感知，进程页表中的内核部分相关的页目录项以及页表项还都是空的。当进程陷入内核态访问这部分页表的的时候，会发现相关页目录或者页表项是空的，就会进入缺页中断的内核处理部分。如果发现缺页的虚拟地址在内核主页表顶级全局页目录表中对应的页目录项 pgd 存在，而缺页地址在进程页表内核部分对应的 pgd 不存在，那么内核就会把内核主页表中 pgd 页目录项里的内容复制给进程页表内核部分中对应的 pgd。事实上，同步内核主页表的工作只需要将缺页地址对应在内核主页表中的顶级全局页目录项 pgd 同步到进程页表内核部分对应的 pgd 地址处就可以了，后面只要与该 pgd 相关的页目录表以及页表发生任何变化，由于是引用的关系，这些改变都会立刻自动反应到进程页表的内核部分中，后面就不需要同步了。
+
+既然已经有了内核主页表，而且内核地址空间包括内核页表又是所有进程共享的，那进程为什么不能直接访问内核主页表而是要访问主页表的拷贝部分呢 ？ 这样还能省去拷贝内核主页表（fork 时候）以及同步内核主页表（缺页时候）这些个开销。之所以这样设计一方面有硬件限制的原因，毕竟每个 CPU 核心只会有一个 CR3/TTBR 寄存器来存放进程页表的顶级页目录起始物理内存地址，没办法同时存放进程页表和内核主页表。另一方面的原因则是操作页表都是需要对其进行加锁的，无论是操作进程页表还是内核主页表。而且在操作页表的过程中可能会涉及到物理内存的分配，这也会引起进程的阻塞。而进程本身可能处于中断上下文以及竞态区中，不能加锁，也不能被阻塞，如果直接对内核主页表加锁的话，那么系统中的其他进程就只能阻塞等待了。所以只能而且必须是操作主内核页表的拷贝，不能直接操作内核主页表。
+
+```c
+static vm_fault_t __do_page_fault(struct mm_struct *mm, unsigned long addr,
+				  unsigned int mm_flags, unsigned long vm_flags,
+				  struct pt_regs *regs)
+{
+    // 在进程虚拟地址空间查找第一个符合条件：address < vma->vm_end 的虚拟内存区域 vma
+	struct vm_area_struct *vma = find_vma(mm, addr);
+	// 如果该缺页地址 address 后面没有 vma 返回 VM_FAULT_BADMAP
+	if (unlikely(!vma))
+		return VM_FAULT_BADMAP;
+
+	/*
+	 * Ok, we have a good vm_area for this memory access, so we can handle
+	 * it.
+	 */
+	if (unlikely(vma->vm_start > addr)) {
+        // vma 不是栈区，返回 VM_FAULT_BADMAP
+		if (!(vma->vm_flags & VM_GROWSDOWN))
+			return VM_FAULT_BADMAP;
+        // vma 是栈区，尝试扩展栈区到 address 地址处
+		if (expand_stack(vma, addr))
+			return VM_FAULT_BADMAP;
+	}
+
+	/*
+	 * Check that the permissions on the VMA allow for the fault which
+	 * occurred.
+	 */
+	if (!(vma->vm_flags & vm_flags))
+		return VM_FAULT_BADACCESS;
+	return handle_mm_fault(vma, addr & PAGE_MASK, mm_flags, regs);
+}
+
+/**
+ * Page fault handlers return a bitmask of %VM_FAULT values.
+ */
+// 通过这个位图可以简要描述一下在整个缺页异常处理的过程中究竟发生了哪些状况，方便内核对各种状况进行针对性处理。
+typedef __bitwise unsigned int vm_fault_t;
+
+/**
+ * enum vm_fault_reason - Page fault handlers return a bitmask of
+ * these values to tell the core VM what happened when handling the
+ * fault. Used to decide whether a process gets delivered SIGBUS or
+ * just gets major/minor fault counters bumped up.
+ *
+ * @VM_FAULT_OOM:		Out Of Memory
+ * @VM_FAULT_SIGBUS:		Bad access
+ * @VM_FAULT_MAJOR:		Page read from storage
+ * @VM_FAULT_WRITE:		Special case for get_user_pages
+ * @VM_FAULT_HWPOISON:		Hit poisoned small page
+ * @VM_FAULT_HWPOISON_LARGE:	Hit poisoned large page. Index encoded
+ *				in upper bits
+ * @VM_FAULT_SIGSEGV:		segmentation fault
+ * @VM_FAULT_NOPAGE:		->fault installed the pte, not return page
+ * @VM_FAULT_LOCKED:		->fault locked the returned page
+ * @VM_FAULT_RETRY:		->fault blocked, must retry
+ * @VM_FAULT_FALLBACK:		huge page fault failed, fall back to small
+ * @VM_FAULT_DONE_COW:		->fault has fully handled COW
+ * @VM_FAULT_NEEDDSYNC:		->fault did not modify page tables and needs
+ *				fsync() to complete (for synchronous page faults
+ *				in DAX)
+ * @VM_FAULT_HINDEX_MASK:	mask HINDEX value
+ *
+ */
+enum vm_fault_reason {
+	VM_FAULT_OOM            = (__force vm_fault_t)0x000001,
+	VM_FAULT_SIGBUS         = (__force vm_fault_t)0x000002,
+	VM_FAULT_MAJOR          = (__force vm_fault_t)0x000004,
+	VM_FAULT_WRITE          = (__force vm_fault_t)0x000008,
+	VM_FAULT_HWPOISON       = (__force vm_fault_t)0x000010,
+	VM_FAULT_HWPOISON_LARGE = (__force vm_fault_t)0x000020,
+	VM_FAULT_SIGSEGV        = (__force vm_fault_t)0x000040,
+	VM_FAULT_NOPAGE         = (__force vm_fault_t)0x000100,
+	VM_FAULT_LOCKED         = (__force vm_fault_t)0x000200,
+	VM_FAULT_RETRY          = (__force vm_fault_t)0x000400,
+	VM_FAULT_FALLBACK       = (__force vm_fault_t)0x000800,
+	VM_FAULT_DONE_COW       = (__force vm_fault_t)0x001000,
+	VM_FAULT_NEEDDSYNC      = (__force vm_fault_t)0x002000,
+	VM_FAULT_HINDEX_MASK    = (__force vm_fault_t)0x0f0000,
+};
+
+/* 比如，位图 vm_fault_t 的第三个比特位置为 1 表示 VM_FAULT_MAJOR，置为 0 表示 VM_FAULT_MINOR。
+ * VM_FAULT_MAJOR 的意思是本次缺页所需要的物理内存页还不在内存中，需要重新分配以及需要启动磁盘 IO，从磁盘中 swap in 进来。
+ * VM_FAULT_MINOR 的意思是本次缺页所需要的物理内存页已经加载进内存中了，缺页处理只需要修改页表重新映射一下就可以了。
+ */
+
+struct task_struct {
+    // 进程总共发生的 VM_FAULT_MINOR 次数
+    unsigned long           min_flt;
+     // 进程总共发生的 VM_FAULT_MAJOR 次数
+    unsigned long           maj_flt;
+}
+```
+
+可以在 ps 命令上增加 -o 选项，添加 `maj_flt` ，`min_flt` 数据列来查看各个进程的 `VM_FAULT_MAJOR` 次数和 `VM_FAULT_MINOR` 次数。
+
+![memory](./images/memory165.png)
