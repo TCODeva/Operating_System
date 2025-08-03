@@ -7267,7 +7267,7 @@ slab 对象的内存布局信息除了以上内容之外，有时候=还需要�
 
 ![memory](./images/memory198.png)
 
-上图展示的就是 slab 对象在内存中的完整布局，其中 object size 为对象真正所需要的内存区域大小，而对象在 slab 中真实的内存占用大小 size 除了 object size 之外，还包括填充的 red zone 区域，以及用于跟踪对象分配和释放信息的 track 结构，另外，如果 slab 设置了 red zone，内核会在对象末尾增加一段 word size 大小的填充 padding 区域。当 slab 向伙伴系统申请若干内存页之后，内核会按照这个 size 将内存页划分成一个一个的内存块，内存块大小为 size 。
+上图展示的就是 slab 对象在内存中的完整布局，其中 object size 为对象真正所需要的内存区域大小，而对象在 slab 中真实的内存占用大小 size 除了 object size 之外，还包括填充的 red zone 区域，以及用于跟踪对象分配和释放信息的 track 结构，另外，如果 slab 设置了 red zone，还需要再 slab 对象内存区域的左侧填充一段 red_left_pad 大小的内存区域作为左侧 red zone，并且内核会在对象末尾增加一段 word size 大小的填充 padding 区域。当 slab 向伙伴系统申请若干内存页之后，内核会按照这个 size 将内存页划分成一个一个的内存块，内存块大小为 size 。
 
 ![memory](./images/memory199.png)
 
@@ -8045,20 +8045,24 @@ static int __init slab_sysfs_init(void)
 }
 ```
 
-###### kmem_cache_open
+##### kmem_cache_open
 
 ```c
 static int kmem_cache_open(struct kmem_cache *s, slab_flags_t flags)
 {
     /* 计算 slab 中对象的整体内存布局所需要的 size，slab 所需最合适的内存页面大小 order，slab 中所能容纳的对象个数
-     * 初始化 slab cache 中的核心参数 oo ,min,max的值
+     * 初始化 slab cache 中的核心参数 oo , min , max 的值
      */
     if (!calculate_sizes(s, -1))
         goto error;
 
-    // 设置 slab cache 在 node 缓存  kmem_cache_node 中的 partial 列表中 slab 的最小个数 min_partial
+    /* 设置 slab cache 在 node 缓存 kmem_cache_node 中的 partial 列表中 slab 的最小个数 min_partial
+     * slab 个数超过该值，空闲的 empty slab 则会被回收至伙伴系统
+     */
     set_min_partial(s, ilog2(s->size) / 2);
-    // 设置 slab cache 在 cpu 本地缓存的 partial 列表中所能容纳的最大空闲对象个数
+    /* 设置 slab cache 在 cpu 本地缓存的 partial 列表中所能容纳的最大空闲对象个数
+     * cpu 本地缓存 partial 链表中空闲对象的数量超过该值，则会将 cpu 本地缓存 partial 链表中的所有 slab 转移到 numa node 缓存中。
+     */
     set_cpu_partial(s);
 
     // 为 slab cache 创建并初始化 node cache 数组
@@ -8067,6 +8071,2145 @@ static int kmem_cache_open(struct kmem_cache *s, slab_flags_t flags)
     // 为 slab cache 创建并初始化 cpu 本地缓存列表
     if (alloc_kmem_cache_cpus(s))
         return 0;
+}
+```
+
+##### calculate_sizes
+
+```c
+static int calculate_sizes(struct kmem_cache *s, int forced_order)
+{
+    slab_flags_t flags = s->flags;
+    unsigned int size = s->object_size;
+    unsigned int order;
+
+    // 为了提高 cpu 访问对象的速度，slab 对象的 object size 首先需要与 word size 进行对齐
+    size = ALIGN(size, sizeof(void *));
+
+#ifdef CONFIG_SLUB_DEBUG
+    /* SLAB_POISON：对象中毒标识，是 slab 中的一个术语，用于将对象所占内存填充某些特定的值，表示这块对象不同的使用状态，防止非法越界访问。
+     * 比如：在将对象分配出去之前，会将对象所占内存用 0x6b 填充，并用 0xa5 填充 object size 区域的最后一个字节。
+     * SLAB_TYPESAFE_BY_RCU：启用 RCU 锁释放 slab
+     */
+    if ((flags & SLAB_POISON) && !(flags & SLAB_TYPESAFE_BY_RCU) &&
+            !s->ctor)
+        s->flags |= __OBJECT_POISON;
+    else
+        s->flags &= ~__OBJECT_POISON;
+
+    /* SLAB_RED_ZONE：表示在空闲对象前后插入 red zone 红色区域（填充特定字节 0xbb），防止对象溢出越界
+     * size == s->object_size 表示对象 object size 与 word size 本来就是对齐的，并没有填充任何字节
+     * 这时就需要在对象 object size 内存区域的后面插入一段 word size 大小的 red zone。
+     * 如果对象 object size 与 word size 不是对齐的，填充了字节，那么这段填充的字节恰好可以作为右侧 red zone，而不需要额外分配 red zone 空间
+     */
+    if ((flags & SLAB_RED_ZONE) && size == s->object_size)
+        size += sizeof(void *);
+#endif
+
+    /* inuse 表示 slab 中的对象实际使用的内存区域大小
+     * 该值是经过与 word size 对齐之后的大小，如果设置了 SLAB_RED_ZONE，则也包括红色区域大小
+     */
+    s->inuse = size;
+
+    if (((flags & (SLAB_TYPESAFE_BY_RCU | SLAB_POISON)) ||
+        s->ctor)) {
+        /* 如果开启了 RCU 保护或者设置了对象 poison或者设置了对象的构造函数，这些都会占用对象中的内存空间。
+         * 这种情况下，需要额外增加一个 word size 大小的空间来存放 free pointer，否则 free pointer 存储在对象的起始位置
+         * offset 为 free pointer 与对象起始地址的偏移
+         */
+        s->offset = size;
+        size += sizeof(void *);
+    }
+
+#ifdef CONFIG_SLUB_DEBUG
+    if (flags & SLAB_STORE_USER)
+        // SLAB_STORE_USER 表示需要跟踪对象的分配和释放信息，需要再对象的末尾增加两个 struct track 结构，存储分配和释放的信息
+        size += 2 * sizeof(struct track);
+
+#ifdef CONFIG_SLUB_DEBUG
+    if (flags & SLAB_RED_ZONE) {
+        // 在对象内存区域的左侧增加 red zone，大小为 red_left_pad，防止对这块对象内存的写越界
+        size += sizeof(void *);
+        s->red_left_pad = sizeof(void *);
+        s->red_left_pad = ALIGN(s->red_left_pad, s->align);
+        size += s->red_left_pad;
+    }
+#endif
+
+    // slab 从它所申请的内存页 offset 0 开始，一个接一个的存储对象，调整对象的 size 保证对象之间按照指定的对齐方式 align 进行对齐
+    size = ALIGN(size, s->align);
+    s->size = size;
+    // 这里 forced_order 传入的是 -1
+    if (forced_order >= 0)
+        order = forced_order;
+    else
+        // 计算 slab 所需要申请的内存页数（2 ^ order 个内存页）
+        order = calculate_order(size);
+
+    if ((int)order < 0)
+        return 0;
+    // 根据 slab 的 flag 设置，设置向伙伴系统申请内存时使用的 allocflags
+    s->allocflags = 0;
+    if (order)
+        // slab 所需要的内存页多于 1 页时，则向伙伴系统申请复合页。
+        s->allocflags |= __GFP_COMP;
+
+    // 从 DMA 区域中获取适用于 DMA 的内存页
+    if (s->flags & SLAB_CACHE_DMA)
+        s->allocflags |= GFP_DMA;
+    // 从 DMA32 区域中获取适用于 DMA 的内存页
+    if (s->flags & SLAB_CACHE_DMA32)
+        s->allocflags |= GFP_DMA32;
+    // 申请可回收的内存页
+    if (s->flags & SLAB_RECLAIM_ACCOUNT)
+        s->allocflags |= __GFP_RECLAIMABLE;
+
+    /* 计算 slab cache 中的 oo，min，max 值，一个 slab 到底需要多少个内存页，能够存储多少个对象
+     * 低 16 为存储 slab 所能包含的对象总数，高 16 为存储 slab 所需的内存页个数
+     */
+    s->oo = oo_make(order, size);
+    // get_order 函数计算出的 order 为容纳一个 size 大小的对象至少需要的内存页个数
+    s->min = oo_make(get_order(size), size);
+    if (oo_objects(s->oo) > oo_objects(s->max))
+        // 初始时 max 和 oo 相等
+        s->max = s->oo;
+    // 返回 slab 中所能容纳的对象个数
+    return !!oo_objects(s->oo);
+}
+
+#define OO_SHIFT    16
+
+struct kmem_cache_order_objects {
+     // 高 16 为存储 slab 所需的内存页个数，低 16 为存储 slab 所能包含的对象总数
+    unsigned int x;
+};
+
+static inline struct kmem_cache_order_objects oo_make(unsigned int order,
+        unsigned int size)
+{
+    struct kmem_cache_order_objects x = {
+        // 高 16 为存储 slab 所需的内存页个数，低 16 为存储 slab 所能包含的对象总数
+        (order << OO_SHIFT) + order_objects(order, size)
+    };
+
+    return x;
+}
+
+static inline unsigned int order_objects(unsigned int order, unsigned int size)
+{
+    // 根据 slab 中包含的物理内存页个数以及对象的 size，计算 slab 可容纳的对象个数
+    return ((unsigned int)PAGE_SIZE << order) / size;
+}
+
+static inline unsigned int oo_order(struct kmem_cache_order_objects x)
+{
+    // 获取高 16 位，slab 中所需要的内存页 order
+    return x.x >> OO_SHIFT;
+}
+
+// 十进制为：65535，二进制为：16 个 1，用于截取低 16 位
+#define OO_MASK     ((1 << OO_SHIFT) - 1) 
+
+static inline unsigned int oo_objects(struct kmem_cache_order_objects x)
+{
+    // 获取低 16 位，slab 中能容纳的对象个数
+    return x.x & OO_MASK;
+}
+```
+
+##### calculate_order
+
+```c
+static unsigned int slub_min_order;
+static unsigned int slub_max_order = PAGE_ALLOC_COSTLY_ORDER;// 3
+static unsigned int slub_min_objects;
+
+static inline int calculate_order(unsigned int size)
+{
+    unsigned int order;
+    unsigned int min_objects;
+    unsigned int max_objects;
+
+    // 计算 slab 中可以容纳的最小对象个数
+    min_objects = slub_min_objects;
+    if (!min_objects)
+        /* nr_cpu_ids 表示当前系统中的 cpu 个数
+         * fls 可以获取参数的最高有效 bit 的位数，比如 fls(0)=0，fls(1)=1，fls(4) = 3
+         * 如果当前系统中有4个cpu，那么 min_object 的初始值为 4*(3+1) = 16 
+         */
+        min_objects = 4 * (fls(nr_cpu_ids) + 1);
+    // slab 最大内存页 order 初始为 3，也就是 slab 最多只能向伙伴系统中申请 8 个内存页。计算 slab 最大可容纳的对象个数
+    max_objects = order_objects(slub_max_order, size);
+    min_objects = min(min_objects, max_objects);
+
+    while (min_objects > 1) {
+        // slab 中的碎片控制系数，碎片大小不能超过 (slab 所占内存大小 / fraction)，fraction 值越大，slab 中所能容忍的碎片就越小
+        unsigned int fraction;
+
+        fraction = 16;
+        while (fraction >= 4) {
+            // 根据当前 fraction 计算 order，需要查找出能够使 slab 产生碎片最小化的 order 值出来
+            order = slab_order(size, min_objects,
+                    slub_max_order, fraction);
+             // order 不能超过 max_order，否则需要降低 fraction，放宽对碎片的要求限制，重新循环计算
+            if (order <= slub_max_order)
+                return order;
+            fraction /= 2;
+        }
+        // 进一步放宽对 min_object 的要求，slab 会尝试少放一些对象
+        min_objects--;
+    }
+
+    /* 经过前边 while 循环的计算，无法在这一个 slab 中放置多个 size 大小的对象，因为 min_object = 1 的时候就退出循环了。
+     * 那么下面就会尝试看能不能只放入一个对象
+     */
+    order = slab_order(size, 1, slub_max_order, 1);
+    if (order <= slub_max_order)
+        return order;
+    // 流程到这里表示，要池化的对象 size 太大了，slub_max_order 都放不下，现在只能放宽对 max_order 的限制到 MAX_ORDER = 11
+    order = slab_order(size, 1, MAX_ORDER, 1);
+    if (order < MAX_ORDER)
+        return order;
+    return -ENOSYS;
+}
+
+// 一个 page 最多允许存放 32767 个对象
+#define MAX_OBJS_PER_PAGE	32767
+
+static inline unsigned int slab_order(unsigned int size,
+        unsigned int min_objects, unsigned int max_order,
+        unsigned int fract_leftover)
+{
+    unsigned int min_order = slub_min_order;
+    unsigned int order;
+
+    // 如果 2 ^ min_order 个内存页可以存放的对象个数超过 32767 限制，那么返回 size * MAX_OBJS_PER_PAGE 所需要的 order 减 1
+    if (order_objects(min_order, size) > MAX_OBJS_PER_PAGE)
+        return get_order(size * MAX_OBJS_PER_PAGE) - 1;
+
+    // 从 slab 所需要的最小 order 到最大 order 之间开始遍历，查找能够使 slab 碎片最小的 order 值
+    for (order = max(min_order, (unsigned int)get_order(min_objects * size));
+            order <= max_order; order++) {
+        // slab 在当前 order 下，所占用的内存大小
+        unsigned int slab_size = (unsigned int)PAGE_SIZE << order;
+        unsigned int rem;
+        // slab 的碎片大小：分配完 object 之后，所产生的碎片大小
+        rem = slab_size % size;
+        // 碎片大小 rem 不能超过 slab_size / fract_leftover 即符合要求
+        if (rem <= slab_size / fract_leftover)
+            break;
+    }
+
+    return order;
+}
+
+// 根据给定的 size 计算出所需最小的 order，size 在 [2^(n-1) * PAGE_SIZE + 1， 2^n * PAGE_SIZE] 之间， order = n
+static inline __attribute_const__ int get_order(unsigned long size)
+{
+    if (__builtin_constant_p(size)) {
+        if (!size)
+            return BITS_PER_LONG - PAGE_SHIFT;
+
+        if (size < (1UL << PAGE_SHIFT))
+            return 0;
+
+        return ilog2((size) - 1) - PAGE_SHIFT + 1;
+    }
+
+    size--;
+    size >>= PAGE_SHIFT;
+#if BITS_PER_LONG == 32
+    return fls(size);
+#else
+    return fls64(size);
+#endif
+}
+```
+
+##### set_min_partial
+
+```c
+#define MIN_PARTIAL 5
+#define MAX_PARTIAL 10
+
+/* 计算 slab cache 在 node 中缓存的个数，kmem_cache_node 中 partial 列表中 slab 个数的上限 min_partial
+ * 超过该值，空闲的 slab 就会被回收，初始 min = ilog2(s->size) / 2，必须保证 min_partial 的值 在 [MIN_PARTIAL,MAX_PARTIAL] 之间
+ */
+static void set_min_partial(struct kmem_cache *s, unsigned long min)
+{
+    if (min < MIN_PARTIAL)
+        min = MIN_PARTIAL;
+    else if (min > MAX_PARTIAL)
+        min = MAX_PARTIAL;
+    s->min_partial = min;
+}
+```
+
+##### set_cpu_partial
+
+```c
+/* 设置 kmem_cache 结构的 cpu_partial 属性，该值限制了 slab cache 在 cpu 本地缓存的 partial 列表中所能容纳的最大空闲对象个数。
+ * 同时该值也决定了当 kmem_cache_cpu->partial 链表为空时，
+ * 内核会从 kmem_cache_node->partial 链表填充 cpu_partial / 2 个 slab 到 kmem_cache_cpu->partial 链表中。
+ */
+static void set_cpu_partial(struct kmem_cache *s)
+{
+// 当配置了 CONFIG_SLUB_CPU_PARTIAL，则 slab cache 的 cpu 本地缓存 kmem_cache_cpu 中包含 partial 列表
+#ifdef CONFIG_SLUB_CPU_PARTIAL
+    // 判断 kmem_cache_cpu 是否包含有 partial 列表
+    if (!kmem_cache_has_cpu_partial(s))
+        s->cpu_partial = 0;
+    else if (s->size >= PAGE_SIZE)
+        s->cpu_partial = 2;
+    else if (s->size >= 1024)
+        s->cpu_partial = 6;
+    else if (s->size >= 256)
+        s->cpu_partial = 13;
+    else
+        s->cpu_partial = 30;
+#endif
+}
+```
+
+##### init_kmem_cache_nodes
+
+```c
+static int init_kmem_cache_nodes(struct kmem_cache *s)
+{
+    int node;
+    // 遍历所有的 numa 节点，为 slab cache 创建 node cache
+    for_each_node_state(node, N_NORMAL_MEMORY) {
+        struct kmem_cache_node *n;
+		/* 当 slub 在系统启动阶段初始化时，创建 kmem_cache_node cache 的时候，此时 slab_state == DOWN
+         * 由于此时 kmem_cache_node cache 正在创建，所以无法利用 kmem_cache_node 所属的 slub cache 动态的分配 kmem_cache_node 对象
+         * 这里会通过 early_kmem_cache_node_alloc 函数静态的分配 kmem_cache_node 对象，并初始化。
+         */
+        if (slab_state == DOWN) {
+            // 创建 boot_kmem_cache_node 时会走到这个分支
+            early_kmem_cache_node_alloc(node);
+            continue;
+        }
+        /* 为 node cache 分配对应的 kmem_cache_node 对象，kmem_cache_node 对象也由它对应的 slab cache 管理
+         * 而当 slab 体系在初始化 boot_kmem_cache 时，这时 slab_state 为 PARTIAL，流程就会走到这里。
+         * 表示此时 boot_kmem_cache_node 已经初始化，可以利用它动态的分配 kmem_cache_node 对象了
+         * 这里的 kmem_cache_node 就是 boot_kmem_cache_node
+         */
+        n = kmem_cache_alloc_node(kmem_cache_node,
+                        GFP_KERNEL, node);
+        // 初始化 node cache
+        init_kmem_cache_node(n);
+        // 初始化 slab cache 结构 kmem_cache 中的 node 数组
+        s->node[node] = n;
+    }
+    return 1;
+}
+
+static void
+init_kmem_cache_node(struct kmem_cache_node *n)
+{
+    n->nr_partial = 0;
+    spin_lock_init(&n->list_lock);
+    INIT_LIST_HEAD(&n->partial);
+#ifdef CONFIG_SLUB_DEBUG
+    atomic_long_set(&n->nr_slabs, 0);
+    atomic_long_set(&n->total_objects, 0);
+    INIT_LIST_HEAD(&n->full);
+#endif
+}
+```
+
+##### alloc_kmem_cache_cpus
+
+```c
+static inline int alloc_kmem_cache_cpus(struct kmem_cache *s)
+{
+    /* 为 slab cache 分配 cpu 本地缓存结构 kmem_cache_cpu
+     * __alloc_percpu 函数在内核中专门用于分配 percpu 类型的结构体（the percpu allocator）
+     * kmem_cache_cpu 结构也是 percpu 类型的，这里通过 __alloc_percpu 直接分配
+     */
+    s->cpu_slab = __alloc_percpu(sizeof(struct kmem_cache_cpu),
+                     2 * sizeof(void *));
+    // 初始化 cpu 本地缓存结构 kmem_cache_cpu
+    init_kmem_cache_cpus(s);
+    return 1;
+}
+static void init_kmem_cache_cpus(struct kmem_cache *s)
+{
+    int cpu;
+    /* 遍历所有CPU，通过 per_cpu_ptr 将前面分配的 kmem_cache_cpu 结构与对应的 CPU 关联对应起来
+     * 同时初始化 kmem_cache_cpu 变量里面的 tid 为其所关联 cpu 的编号
+     */
+    for_each_possible_cpu(cpu)
+        per_cpu_ptr(s->cpu_slab, cpu)->tid = init_tid(cpu);
+}
+```
+
+##### first slab cache
+
+在 slab cache 创建的过程中需要创建两个特殊的数据结构：
+
+- 一个是 slab cache 自身的管理结构 `struct kmem_cache`。
+- 另一个是 slab cache 在 NUMA 节点中的缓存结构 `struct kmem_cache_node`。
+
+而 `struct kmem_cache` 和 `struct kmem_cache_node` 同样也都是内核的核心数据结构，他俩各自也有一个专属的 slab cache 来管理 `kmem_cache` 对象和 `kmem_cache_node` 对象的分配与释放。
+
+```c
+// 全局变量，用于专门管理 kmem_cache 对象的 slab cache，定义在文件：/mm/slab_common.c
+struct kmem_cache *kmem_cache;
+
+// 全局变量，用于专门管理 kmem_cache_node 对象的 slab cache，定义在文件：/mm/slub.c
+static struct kmem_cache *kmem_cache_node;
+```
+
+slab cache 的 cpu 本地缓存结构 `struct kmem_cache_cpu` 是一个 percpu 类型的变量，由 `__alloc_percpu`直接创建，并不需要一个专门的 slab cache 来管理。在 slab cache 的创建过程中，内核首先需要向 `struct kmem_cache` 结构专属的 slab cache 申请一个 `kmem_cache` 对象。当 `kmem_cache` 对象初始化完成之后，内核需要向 `struct kmem_cache_node` 结构专属的 slab cache 申请一个 `kmem_cache_node` 对象，作为 slab cache 在 NUMA 节点中的缓存结构。
+
+那么问题来了，`kmem_cache` 和 `kmem_cache_node` 这两个 slab cache 是怎么来的？因为他俩本质上是一个 slab cache，而 slab cache 的创建又需要 `kmem_cache` （slab cache）和 `kmem_cache_node` （slab cache），当系统中第一个 slab cache 被创建的时候，此时并没有 `kmem_cache` （slab cache），也没有 `kmem_cache_node` （slab cache），这就变成死锁了，是一个先有鸡还是先有蛋的问题。
+
+```c
+void __init kmem_cache_init(void)
+{
+    /* slab allocator 体系结构中最核心的就是 kmem_cache 结构和 kmem_cache_node 结构，而这两个结构同时又被各自的 slab cache 所管理
+     * 而现在 slab allocator 体系还未创建，所以需要利用两个静态的结构来创建 kmem_cache，kmem_cache_node 对象
+     * 这里就是定义两个 kmem_cache 类型的静态局部变量（静态结构）：内核启动的时候被加载进 BSS 段中，随后会为其分配内存。
+     * boot_kmem_cache 用于临时创建 kmem_cache 结构。
+     * boot_kmem_cache_node 用于临时创建 kmem_cache_node 结构
+     * boot_kmem_cache 和 boot_kmem_cache_node 现在只是两个空的结构，需要静态的进行初始化。
+     */
+    static __initdata struct kmem_cache boot_kmem_cache,
+        boot_kmem_cache_node;
+
+    // 暂时先将这两个静态结构赋值给对应的全局变量，后面会初始化这两个全局变量
+    kmem_cache_node = &boot_kmem_cache_node;
+    kmem_cache = &boot_kmem_cache;
+
+    // 静态地初始化 boot_kmem_cache_node，从这里可以看出 slab 体系，建立的第一个 slab cache 就是 kmem_cache_node(slab cache)
+    create_boot_cache(kmem_cache_node, "kmem_cache_node",
+        sizeof(struct kmem_cache_node), SLAB_HWCACHE_ALIGN, 0, 0);
+
+    /* 当 kmem_cache_node （slab cache）被创建初始化之后，slab_state 变为 PARTIAL
+     * 这个状态表示目前 kmem_cache_node cache 已经创建完毕，可以利用它动态分配 kmem_cache_node 对象了。
+     */
+    slab_state = PARTIAL;
+
+    // 静态地初始化 boot_kmem_cache，从这里可以看出 slab 体系，建立的第二个 slab cache 就是 kmem_cache(slab cache)
+    create_boot_cache(kmem_cache, "kmem_cache",
+            offsetof(struct kmem_cache, node) +
+                nr_node_ids * sizeof(struct kmem_cache_node *),
+               SLAB_HWCACHE_ALIGN, 0, 0);
+
+    /* 流程到这里，两个静态的 kmem_cache 结构：boot_kmem_cache，boot_kmem_cache_node 就已经初始化完毕了。
+     * 但是这两个静态结构只是临时的，目的是为了在 slab 体系初始化阶段静态的创建 kmem_cache 对象和 kmem_cache_node 对象。
+     * 在 bootstrap 中会将 boot_kmem_cache，boot_kmem_cache_node 中的内容深拷贝到最终的 kmem_cache（slab cache），
+     * kmem_cache_node（slab cache）中。后面就可以利用这两个最终的核心结构来动态的进行 slab 创建。
+     */
+    kmem_cache = bootstrap(&boot_kmem_cache);
+    kmem_cache_node = bootstrap(&boot_kmem_cache_node);
+
+    ......
+}
+
+/* Create a cache during boot when no slab services are available yet */
+void __init create_boot_cache(struct kmem_cache *s, const char *name,
+        unsigned int size, slab_flags_t flags,
+        unsigned int useroffset, unsigned int usersize)
+{
+    int err;
+    unsigned int align = ARCH_KMALLOC_MINALIGN;
+
+    // 下面就是静态初始化 kmem_cache 结构的逻辑，挨个对 kmem_cache 结构的核心属性进行静态赋值
+    s->name = name;
+    s->size = s->object_size = size;
+
+    if (is_power_of_2(size))
+        align = max(align, size);
+    // 根据指定的对齐参数 align 以及 CPU Cache line 的大小计算出一个合适的 align 出来
+    s->align = calculate_alignment(flags, align, size);
+
+    s->useroffset = useroffset;
+    s->usersize = usersize;
+    /* 这里又来到了之前介绍的创建 slab cache 的创建流程
+     * 该函数是创建 slab cache 的核心函数，这里会初始化 kmem_cache 结构中的其他重要属性
+     * 以及创建初始化 slab cache 中的 cpu 本地缓存 和 node 节点缓存结构
+     */
+    err = __kmem_cache_create(s, flags);
+    // 暂时不需要合并 merge，引用计数设置为 -1
+    s->refcount = -1; 
+}
+
+static void early_kmem_cache_node_alloc(int node)
+{
+    /* slab 的本质就是一个或者多个物理内存页 page，这里用于指向 slab 所属的 page。
+     * 如果 slab 是由多个物理页 page 组成（复合页），这里指向复合页的首页
+     */
+    struct page *page;
+    // 这里主要为 boot_kmem_cache_node 初始化它的 node cache 数组，这里会静态创建指定 node 节点对应的 kmem_cache_node 结构
+    struct kmem_cache_node *n;
+
+    /* 此时 boot_kmem_cache_node 这个 kmem_cache 结构已经初始化好了。
+     * 根据 kmem_cache 结构中的 kmem_cache_order_objects oo 属性向指定 node 节点所属的伙伴系统申请 2^order 个内存页 page
+     * 这里返回复合页的首页，目的是为 kmem_cache_node 结构分配 slab，后续该 slab 会挂在 kmem_cache_node 结构中的 partial 列表中
+     */
+    page = new_slab(kmem_cache_node, GFP_NOWAIT, node);
+
+    // struct page 结构中的 freelist 指向 slab 中第一个空闲的对象，这里的对象就是 struct kmem_cache_node 结构
+    n = page->freelist;
+#ifdef CONFIG_SLUB_DEBUG
+    // 根据 slab cache 中的 flag 初始化 kmem_cache_node 对象
+    init_object(kmem_cache_node, n, SLUB_RED_ACTIVE);
+#endif
+    // 重新设置 slab 中的下一个空闲对象。这里是获取对象 n 中的 free_pointer 指针,指向 n 的下一个空闲对象
+    page->freelist = get_freepointer(kmem_cache_node, n);
+    // 表示 slab 中已经有一个对象被使用了
+    page->inuse = 1;
+    /* 这里可以看出 boot_kmem_cache_node 的 NUMA 节点缓存在这里初始化的时候
+     * 内核会为每个 NUMA 节点申请一个 slab，并缓存在它的 partial 链表中
+     * 并不是缓存在 boot_kmem_cache_node 的本地 cpu 缓存中
+     */
+    page->frozen = 0;
+    // 这里的 kmem_cache_node 指的是 boot_kmem_cache_node，初始化 boot_kmem_cache_node 中的 node cache 数组
+    kmem_cache_node->node[node] = n;
+    // 初始化 node 节点对应的 kmem_cache_node 结构
+    init_kmem_cache_node(n);
+    // kmem_cache_node 结构中的 nr_slabs 计数加1，total_objects 加 page->objects
+    inc_slabs_node(kmem_cache_node, node, page->objects);
+    // 将新创建出来的 slab （page表示），添加到对象 n （kmem_cache_node结构）中的 partial 列表头部
+    __add_partial(n, page, DEACTIVATE_TO_HEAD);
+}
+```
+
+当 boot_kmem_cache_node 被初始化之后，它的整个结构如下图所示：
+
+![memory](./images/memory237.png)
+
+`boot_kmem_cache` 和 `boot_kmem_cache_node` 只是临时的 `kmem_cache 结构`，目的是在 slab allocator 体系初始化的时候用于静态创建 `kmem_cache` （slab cache）， `kmem_cache_node` （slab cache）。最后需要将这两个静态临时结构深拷贝到最终的全局 `kmem_cache` 结构中。
+
+```c
+static struct kmem_cache * __init bootstrap(struct kmem_cache *static_cache)
+{
+    int node;
+    // kmem_cache 指向专门管理 kmem_cache 对象的 slab cache，该 slab cache 现在已经全部初始化完毕，可以利用它动态的分配最终的 kmem_cache 对象
+    struct kmem_cache *s = kmem_cache_zalloc(kmem_cache, GFP_NOWAIT);
+    struct kmem_cache_node *n;
+    // 将静态的 kmem_cache 对象，比如：boot_kmem_cache，boot_kmem_cache_node 深拷贝到最终的 kmem_cache 对象 s 中
+    memcpy(s, static_cache, kmem_cache->object_size);
+
+    // 释放本地 cpu 缓存的 slab
+    __flush_cpu_slab(s, smp_processor_id());
+    /* 遍历 node cache 数组，修正 kmem_cache_node 结构中 partial 链表中包含的 slab（ page 表示）对应 page 结构的 slab_cache 指针
+     * 使其指向最终的 kmem_cache 结构，之前在 create_boot_cache 中指向的静态 kmem_cache 结构，这里需要修正
+     */
+    for_each_kmem_cache_node(s, node, n) {
+        struct page *p;
+
+        list_for_each_entry(p, &n->partial, slab_list)
+            p->slab_cache = s;
+    }
+    // 将最终的 kmem_cache 结构加入到全局 slab cache 链表中
+    list_add(&s->list, &slab_caches);
+    return s;
+}
+```
+
+优先创建 `kmem_cache_node` 是为了在创建 `kmem_cache->kmem_cache_node` 可以直接动态创建，而非再走静态分配流程。
+
+#### slab cache 分配内存
+
+内核中通过 `kmem_cache_alloc_node` 函数要求 slab cache 从指定的 NUMA 节点中分配对象。
+
+```c
+// 定义在文件：/mm/slub.c
+void *kmem_cache_alloc_node(struct kmem_cache *s, gfp_t gfpflags, int node)
+{
+    void *ret = slab_alloc_node(s, gfpflags, node, _RET_IP_);
+    return ret;
+}
+```
+
+![memory](./images/memory238.png)
+
+```c
+static __always_inline void *slab_alloc_node(struct kmem_cache *s,
+        gfp_t gfpflags, int node, unsigned long addr)
+{
+    // 用于指向分配成功的对象
+    void *object;
+    // slab cache 在当前 cpu 下的本地 cpu 缓存
+    struct kmem_cache_cpu *c;
+    // object 所在的内存页
+    struct page *page;
+    // 当前 cpu 编号
+    unsigned long tid;
+
+redo:
+    /* slab cache 首先尝试从当前 cpu 本地缓存 kmem_cache_cpu 中获取空闲对象
+     * 这里的 do..while 循环是要保证获取到的 cpu 本地缓存 c 是属于执行进程的当前 cpu
+     * 因为进程可能由于抢占或者中断的原因被调度到其他 cpu 上执行，所需需要确保两者的 tid 是否一致
+     */
+    do {
+        // 获取执行当前进程的 cpu 中的 tid 字段
+        tid = this_cpu_read(s->cpu_slab->tid);
+        // 获取 cpu 本地缓存 cpu_slab
+        c = raw_cpu_ptr(s->cpu_slab);
+        /* 如果开启了 CONFIG_PREEMPT 表示允许优先级更高的进程抢占当前 cpu
+         * 如果发生抢占，当前进程可能被重新调度到其他 cpu 上运行，所以需要检查此时运行当前进程的 cpu tid 是否与刚才获取的 cpu 本地缓存一致
+         * 如果两者的 tid 字段不一致，说明进程已经被调度到其他 cpu 上了， 需要再次获取正确的 cpu 本地缓存
+         */
+    } while (IS_ENABLED(CONFIG_PREEMPT) &&
+         unlikely(tid != READ_ONCE(c->tid)));
+
+    /* 从 slab cache 的 cpu 本地缓存 kmem_cache_cpu 中获取缓存的 slub 空闲对象列表
+     * 这里的 freelist 指向本地 cpu 缓存的 slub 中第一个空闲对象
+     */
+    object = c->freelist;
+    // 获取本地 cpu 缓存的 slub，这里用 page 表示，如果是复合页，这里指向复合页的首页 head page
+    page = c->page;
+    if (unlikely(!object || !node_match(page, node))) {
+        /* 如果 slab cache 的 cpu 本地缓存中已经没有空闲对象了
+         * 或者 cpu 本地缓存中的 slub 并不属于指定的 NUMA 节点
+         * 那么就需要进入慢速路径中分配对象:
+         * 1. 检查 kmem_cache_cpu 的 partial 列表中是否有空闲的 slub
+         * 2. 检查 kmem_cache_node 的 partial 列表中是否有空闲的 slub
+         * 3. 如果都没有，则只能重新到伙伴系统中去申请内存页
+         */
+        object = __slab_alloc(s, gfpflags, node, addr, c);
+        // 统计 slab cache 的状态信息，记录本次分配走的是慢速路径 slow path
+        stat(s, ALLOC_SLOWPATH);
+    } else {
+        /* 走到该分支表示，slab cache 的 cpu 本地缓存中还有空闲对象，直接分配
+         * 快速路径 fast path 下分配成功，从当前空闲对象中获取下一个空闲对象指针 next_object        
+         */
+        void *next_object = get_freepointer_safe(s, object);
+        // 更新 kmem_cache_cpu 结构中的 freelist 指向 next_object
+        if (unlikely(!this_cpu_cmpxchg_double(
+                s->cpu_slab->freelist, s->cpu_slab->tid,
+                object, tid,
+                next_object, next_tid(tid)))) {
+
+            note_cmpxchg_failure("slab_alloc", s, tid);
+            goto redo;
+        }
+        // cpu 预取 next_object 的 freepointer 到 cpu 高速缓存，加快下一次分配对象的速度
+        prefetch_freepointer(s, next_object);
+        stat(s, ALLOC_FASTPATH);
+    }
+
+    // 如果 gfpflags 掩码中设置了  __GFP_ZERO，则需要将对象所占的内存初始化为零值
+    if (unlikely(slab_want_init_on_alloc(gfpflags, s)) && object)
+        memset(object, 0, s->object_size);
+    // 返回分配好的对象
+    return object;
+}
+```
+
+##### fastpath
+
+```c
+static inline void *get_freepointer_safe(struct kmem_cache *s, void *object)
+{
+    // freepointer 在 object 内存区域的起始地址
+    unsigned long freepointer_addr;
+    // 指向下一个空闲对象的 free_pontier
+    void *p;
+    // free_pointer 位于 object 起始地址的 offset 偏移处
+    freepointer_addr = (unsigned long)object + s->offset;
+    // 获取 free_pointer 指向的地址（下一个空闲对象）
+    probe_kernel_read(&p, (void **)freepointer_addr, sizeof(p));
+    // 返回下一个空闲对象地址
+    return freelist_ptr(s, p, freepointer_addr);
+}
+```
+
+##### slowpath
+
+```c
+static void *__slab_alloc(struct kmem_cache *s, gfp_t gfpflags, int node,
+              unsigned long addr, struct kmem_cache_cpu *c)
+{
+    void *p;
+    unsigned long flags;
+    // 关闭 cpu 中断，防止并发访问
+    local_irq_save(flags);
+#ifdef CONFIG_PREEMPT
+    /* 当开启了 CONFIG_PREEMPT，表示允许其他进程抢占当前 cpu
+     * 运行进程的当前 cpu 可能会被其他优先级更高的进程抢占，当前进程可能会被调度到其他 cpu 上
+     * 所以这里需要重新获取 slab cache 的 cpu 本地缓存
+     */
+    c = this_cpu_ptr(s->cpu_slab);
+#endif
+    // 进入 slab cache 的慢速分配路径
+    p = ___slab_alloc(s, gfpflags, node, addr, c);
+    // 恢复 cpu 中断
+    local_irq_restore(flags);
+    return p;
+}
+```
+
+![memory](./images/memory239.png)
+
+```c
+static void *___slab_alloc(struct kmem_cache *s, gfp_t gfpflags, int node,
+              unsigned long addr, struct kmem_cache_cpu *c)
+{
+    // 指向 slub 中可供分配的第一个空闲对象
+    void *freelist;
+    // 空闲对象所在的 slub （用 page 表示）
+    struct page *page;
+    // 从 slab cache 的本地 cpu 缓存中获取缓存的 slub
+    page = c->page;
+    if (!page)
+        // 如果缓存的 slub 中的对象已经被全部分配出去，没有空闲对象了，那么就会跳转到 new_slab 分支进行降级处理走慢速分配路径
+        goto new_slab;
+redo:
+
+    /* 这里需要再次检查 slab cache 本地 cpu 缓存中的 freelist 是否有空闲对象
+     * 因为当前进程可能被中断，当重新调度之后，其他进程可能已经释放了一些对象到缓存 slab 中
+     * freelist 可能此时就不为空了，所以需要再次尝试一下
+     */
+    freelist = c->freelist;
+    if (freelist)
+        // 从 cpu 本地缓存中的 slub 中直接分配对象
+        goto load_freelist;
+
+    /* 本地 cpu 缓存的 slub 用 page 结构来表示，这里是检查 page 结构的 freelist 是否还有空闲对象
+     * c->freelist 表示的是本地 cpu 缓存的空闲对象列表，刚刚已经检查过了
+     * 现在检查的 page->freelist ，它表示由其他 cpu 所释放的空闲对象列表
+     * 因为此时有可能其他 cpu 又释放了一些对象到 slub 中这时 slub 对应的 page->freelist 不为空，可以直接分配
+     */
+    freelist = get_freelist(s, page);
+    // 注意这里的 freelist 已经变为 page->freelist ，并不是 c->freelist;
+    if (!freelist) {
+        // 此时 cpu 本地缓存的 slub 里的空闲对象已经全部耗尽，slub 从 cpu 本地缓存中脱离，进入 new_slab 分支走慢速分配路径
+        c->page = NULL;
+        stat(s, DEACTIVATE_BYPASS);
+        goto new_slab;
+    }
+
+    stat(s, ALLOC_REFILL);
+
+load_freelist:
+    // 被 slab cache 的 cpu 本地缓存的 slub 所属的 page 必须是 frozen 冻结状态，只允许本地 cpu 从中分配对象
+    VM_BUG_ON(!c->page->frozen);
+    /* kmem_cache_cpu 中的 freelist 指向被 cpu 缓存 slub 中第一个空闲对象
+     * 由于第一个空闲对象马上要被分配出去，所以这里需要获取下一个空闲对象更新 freelist
+     */
+    c->freelist = get_freepointer(s, freelist);
+    // 更新 slab cache 的 cpu 本地缓存分配对象时的全局 transaction id，每当分配完一次对象，kmem_cache_cpu 中的 tid 都需要改变
+    c->tid = next_tid(c->tid);
+    // 返回第一个空闲对象
+    return freelist;
+
+new_slab:
+    // 查看 kmem_cache_cpu->partial 链表中是否有 slab 可供分配对象
+    if (slub_percpu_partial(c)) {
+        /* 获取 cpu 本地缓存 kmem_cache_cpu 的 partial 列表中的第一个 slub （用 page 表示）
+         * 并将这个 slub 提升为 cpu 本地缓存中的 slub，赋值给 c->page
+         */
+        page = c->page = slub_percpu_partial(c);
+        // 将 partial 列表中第一个 slub （c->page）从 partial 列表中摘下，并将列表中的下一个 slub 更新为 partial 列表的头结点
+        slub_set_percpu_partial(c, page);
+        // 更新状态信息，记录本次分配是从 kmem_cache_cpu 的 partial 列表中分配
+        stat(s, CPU_PARTIAL_ALLOC);
+        /* 重新回到 redo 分支，这下就可以从 page->freelist 中获取对象了
+         * 并且在 load_freelist 分支中将  page->freelist 更新到 c->freelist 中，page->freelist 设置为 null
+         * 此时 slab cache 中的 cpu 本地缓存 kmem_cache_cpu 的 freelist 以及 page 就变为了 partial 列表中的 slub
+         */
+        goto redo;
+    }
+
+    /* 流程走到这里表示 slab cache 中的 cpu 本地缓存 partial 列表中也没有 slub 了
+     * 需要近一步降级到 numa node cache —— kmem_cache_node 中的 partial 列表去查找
+     * 如果还是没有，就只能去伙伴系统中申请新的 slub，然后分配对象
+     * 该函数为 slab cache 在慢速路径下分配对象的核心逻辑
+     */
+    freelist = new_slab_objects(s, gfpflags, node, &c);
+
+    if (unlikely(!freelist)) {
+        // 如果伙伴系统中无法分配 slub 所需的 page，那么就提示内存不足，分配失败，返回 null
+        slab_out_of_memory(s, gfpflags, node);
+        return NULL;
+    }
+
+    page = c->page;
+    if (likely(!kmem_cache_debug(s) && pfmemalloc_match(page, gfpflags)))
+        /* 此时从 kmem_cache_node->partial 列表中获取的 slub 
+         * 或者从伙伴系统中重新申请的 slub 已经被提升为本地 cpu 缓存了 kmem_cache_cpu->page
+         * 这里需要跳转到 load_freelist 分支，从本地 cpu 缓存 slub 中获取第一个对象返回
+         */
+        goto load_freelist;
+ 
+}
+
+// 定义在文件 /include/linux/slub_def.h 中
+#ifdef CONFIG_SLUB_CPU_PARTIAL
+// 获取 slab cache 本地 cpu 缓存的 partial 列表
+#define slub_percpu_partial(c)      ((c)->partial)
+// 将 partial 列表中第一个 slub 摘下，提升为 cpu 本地缓存，用于后续快速分配对象
+#define slub_set_percpu_partial(c, p)       \
+({                      \
+    slub_percpu_partial(c) = (p)->next; \
+})
+```
+
+在 slab cache 的整个架构体系中的确存在两个 freelist：
+
+- 一个是 `page->freelist`，因为 slab 在内核中是使用 `struct page` 结构来表示的，所以 `page->freelist` 只是单纯的站在 slab 的视角来表示 slab 中的空闲对象列表，这里不考虑 slab 在 slab cache 架构中的位置。
+- 另一个是 `kmem_cache_cpu->freelist`，特指 slab 被 slab cache 的本地 cpu 缓存之后，slab 中的空闲对象链表。这里可以理解为 slab 中被 cpu 缓存的空闲对象。当 slab 被提升为 cpu 缓存之后，`page->freeelist` 直接赋值给 `kmem_cache_cpu->freelist`，然后 `page->freeelist` 置空。`slab->frozen` 设置为 1，表示 slab 被冻结在当前 cpu 的本地缓存中。
+
+![memory](./images/memory240.png)
+
+而 slab 一旦被当前 cpu 缓存，它的状态就变为了冻结状态（`slab->frozen` = 1），处于冻结状态下的 slab，当前 cpu 可以从该 slab 中分配或者释放对象，**但是其他 cpu 只能释放对象到该 slab 中，不能从该 slab 中分配对象**。
+
+- 如果一个 slab 被一个 cpu 缓存之后，那么这个 cpu 在该 slab 看来就是本地 cpu，当本地 cpu 释放对象回这个 slab 的时候会释放回 `kmem_cache_cpu->freelist` 链表中
+- 如果其他 cpu 想要释放对象回该 slab 时，其他 cpu 只能将对象释放回该 slab 的 `page->freelist` 中。
+
+如下图所示，cpu1 在本地缓存了 slab1，cpu2 在本地缓存了 slab2，进程先从 slab1 中获取了一个对象，正常情况下如果进程一直在 cpu1 上运行的话，当进程释放该对象回 slab1 中时，会直接释放回 `kmem_cache_cpu1->freelist` 链表中。但如果进程在 slab1 中获取完对象之后，被调度到了 cpu2 上运行，这时进程想要释放对象回 slab1 中时，就不能走快速路径了，因为 cpu2 本地缓存的是 slab2，所以 cpu2 只能将对象释放至 slab1->freelist 中。
+
+![memory](./images/memory241.png)
+
+这种情况下，在 slab1 的内部视角里，就有了两个 freelist 链表，它们的共同之处都是用于组织 slab1 中的空闲对象，但是 `kmem_cache_cpu1->freelist` 链表中组织的是缓存在 cpu1 本地的空闲对象，slab1->freelist 链表组织的是由其他 cpu 释放的空闲对象。
+
+再次回到 `___slab_alloc` 函数的开始处，首先内核会在 slab cache 的本地 cpu 缓存 `kmem_cache_cpu->freelist` 中查找是否有空闲对象，如果这里没有，内核会继续到 `page->freelist` 中查看是否有其他 cpu 释放的空闲对象。如果两个 freelist 链表都没有空闲对象了，那就证明 slab cache 在当前 cpu 本地缓存中的 slab 已经为空了，将该 slab 从当前 cpu 本地缓存中脱离解冻，程序跳转到 `new_slab` 分支进入慢速分配路径。
+
+```c
+// 查看 page->freelist 中是否有其他 cpu 释放的空闲对象
+static inline void *get_freelist(struct kmem_cache *s, struct page *page)
+{
+    // 用于存放要更新的 page 属性值
+    struct page new;
+    unsigned long counters;
+    void *freelist;
+
+    do {
+        /* 获取 page 结构的 freelist，当其他 cpu 向 page 释放对象时 freelist 指向被释放的空闲对象
+         * 当 page 被 slab cache 的 cpu 本地缓存时，freelist 置为 null
+         */
+        freelist = page->freelist;
+        counters = page->counters;
+
+        new.counters = counters;
+        VM_BUG_ON(!new.frozen);
+        // 更新 inuse 字段，表示 page 中的对象 objects 全部被分配出去了
+        new.inuse = page->objects;
+        /* 如果 freelist != null，表示其他 cpu 又释放了一些对象到 page 中 （slub）。
+         * 则 page->frozen = 1 , slub 依然冻结在 cpu 本地缓存中
+         * 如果 freelist == null,则 page->frozen = 0， slub 从 cpu 本地缓存中脱离解冻
+         */
+        new.frozen = freelist != NULL;
+        /* 最后 cas 原子更新 page 结构中的相应属性
+         * 这里需要注意的是，当 page 被 slab cache 本地 cpu 缓存时，page->freelist 需要置空。
+         * 因为在本地 cpu 缓存场景下 page->freelist 指向其他 cpu 释放的空闲对象列表
+         * kmem_cache_cpu->freelist 指向的是被本地 cpu 缓存的空闲对象列表
+         * 这两个列表中的空闲对象共同组成了 slub 中的空闲对象
+         */
+    } while (!__cmpxchg_double_slab(s, page,
+        freelist, counters,
+        NULL, new.counters,
+        "get_freelist"));
+
+    return freelist;
+}
+
+// slab cache 慢速路径下分配对象核心逻辑
+static inline void *new_slab_objects(struct kmem_cache *s, gfp_t flags,
+            int node, struct kmem_cache_cpu **pc)
+{
+    // 从 numa node cache 中获取到的空闲对象列表
+    void *freelist;
+    // slab cache 本地 cpu 缓存
+    struct kmem_cache_cpu *c = *pc;
+    // 分配对象所在的内存页
+    struct page *page;
+    /* 尝试从指定的 node 节点缓存 kmem_cache_node 中的 partial 列表获取可以分配空闲对象的 slub
+     * 如果指定 numa 节点的内存不足，则会根据 cpu 访问距离的远近，进行跨 numa 节点分配
+     */
+    freelist = get_partial(s, flags, node, c);
+
+    if (freelist)
+        // 返回 numa cache 中缓存的空闲对象列表
+        return freelist;
+    /* 流程走到这里说明 numa cache 里缓存的 slub 也用尽了，无法找到可以分配对象的 slub 了
+     * 只能向底层伙伴系统重新申请内存页（slub），然后从新的 slub 中分配对象
+     */
+    page = new_slab(s, flags, node);
+    // 将新申请的内存页 page （slub），缓存到 slab cache 的本地 cpu 缓存中
+    if (page) {
+        // 获取 slab cache 的本地 cpu 缓存
+        c = raw_cpu_ptr(s->cpu_slab);
+        // 刷新本地 cpu 缓存，将旧的 slub 缓存与 cpu 本地缓存解绑
+        if (c->page)
+            flush_slab(s, c);
+
+        // 将新申请的 slub 与 cpu 本地缓存绑定，page->freelist 赋值给 kmem_cache_cpu->freelist
+        freelist = page->freelist;
+        // 绑定之后  page->freelist 置空，现在新的 slub 中的空闲对象就已经缓存再了 slab cache 的本地 cpu 缓存中，后续就直接从这里分配了
+        page->freelist = NULL;
+
+        stat(s, ALLOC_SLAB);
+        // 将新申请的 slub 对应的 page 赋值给 kmem_cache_cpu->page
+        c->page = page;
+        *pc = c;
+    }
+    // 返回空闲对象列表
+    return freelist;
+}
+
+/* 选取合适的 NUMA 节点缓存，优先使用指定的 NUMA 节点，如果指定的 NUMA 节点中没有足够的内存，
+ * 内核就会跨 NUMA 节点按照访问距离的远近，选取一个合适的 NUMA 节点。
+ */
+static void *get_partial(struct kmem_cache *s, gfp_t flags, int node,
+        struct kmem_cache_cpu *c)
+{
+    // 从指定 node 的 kmem_cache_node 缓存中的 partial 列表中获取到的对象
+    void *object;
+    // 即将要所搜索的 kmem_cache_node 缓存对应 numa node
+    int searchnode = node;
+    // 如果指定的 numa node 已经没有空闲内存了，则选取访问距离最近的 numa node 进行跨节点内存分配
+    if (node == NUMA_NO_NODE)
+        searchnode = numa_mem_id();
+    else if (!node_present_pages(node))
+        searchnode = node_to_mem_node(node);
+
+    // 从 searchnode 的 kmem_cache_node 缓存中的 partial 列表中获取对象
+    object = get_partial_node(s, get_node(s, searchnode), c, flags);
+    if (object || node != NUMA_NO_NODE)
+        return object;
+    /* 如果 searchnode 对象的 kmem_cache_node 缓存中的 partial 列表是空的，没有任何可供分配的 slub
+     * 那么继续按照访问距离，遍历 searchnode 之后的 numa node，进行跨节点内存分配
+     */
+    return get_any_partial(s, flags, c);
+}
+
+/*
+ * Try to allocate a partial slab from a specific node.
+ */
+static void *get_partial_node(struct kmem_cache *s, struct kmem_cache_node *n,
+                struct kmem_cache_cpu *c, gfp_t flags)
+{
+    // 接下来就会挨个遍历 kmem_cache_node 的 partial 列表中的 slub，这两个变量用于临时存储遍历的 slub
+    struct page *page, *page2;
+    // 用于指向从 partial 列表 slub 中申请到的对象
+    void *object = NULL;
+    // 用于记录 slab cache 本地 cpu 缓存 kmem_cache_cpu 中所缓存的空闲对象总数（包括 partial 列表），后续会向 kmem_cache_cpu 中填充 slub
+    unsigned int available = 0;
+    // 临时记录遍历到的 slub 中包含的剩余空闲对象个数
+    int objects;
+
+    spin_lock(&n->list_lock);
+    // 开始挨个遍历 kmem_cache_node 的 partial 列表，获取 slub 用于分配对象以及填充 kmem_cache_cpu
+    list_for_each_entry_safe(page, page2, &n->partial, slab_list) {
+        void *t;
+        // page 表示当前遍历到的 slub，这里会从该 slub 中获取空闲对象赋值给 t，并将 slub 从 kmem_cache_node 的 partial 列表上摘下
+        t = acquire_slab(s, n, page, object == NULL, &objects);
+        // 如果 t 是空的，说明 partial 列表上已经没有可供分配对象的 slub 了，slub 都满了，退出循环，进入伙伴系统重新申请 slub
+        if (!t)            
+            break;
+        /* objects 表示当前 slub 中包含的剩余空闲对象个数
+         * available 用于统计目前遍历的 slub 中所有空闲对象个数
+         * 后面会根据 available 的值来判断是否继续填充 kmem_cache_cpu
+         */
+        available += objects;
+        if (!object) {
+            // 第一次循环会走到这里，第一次循环主要是满足当前对象分配的需求，将 partial 列表中第一个 slub 缓存进 kmem_cache_cpu->page 中
+            c->page = page;
+            stat(s, ALLOC_FROM_PARTIAL);
+            object = t;
+        } else {
+            /* 第二次以及后面的循环就会走到这里，目的是从 kmem_cache_node 的 partial 列表中摘下 slub，
+             * 然后填充进 kmem_cache_cpu->partial 列表里
+             */
+            put_cpu_partial(s, page, 0);
+            stat(s, CPU_PARTIAL_NODE);
+        }
+        /* 这里是用于判断是否继续填充 kmem_cache_cpu 中的 partial 列表
+         * kmem_cache_has_cpu_partial 用于判断 slab cache 是否配置了 cpu 缓存的 partial 列表
+         * 配置了 CONFIG_SLUB_CPU_PARTIAL 选项意味着开启 kmem_cache_cpu 中的 partial 列表，没有配置的话，cpu 缓存中就不会有 partial 列表
+         * kmem_cache_cpu 中缓存被填充之后的空闲对象个数（包括 partial 列表）不能超过 ( kmem_cache 结构中 cpu_partial 指定的个数 / 2 )
+         */
+        if (!kmem_cache_has_cpu_partial(s)
+            || available > slub_cpu_partial(s) / 2)
+            // kmem_cache_cpu 已经填充满了，就退出循环，停止填充
+            break;
+
+    }
+  
+    spin_unlock(&n->list_lock);
+    return object;
+}
+
+/* 从 kmem_cache_node 的 partial 列表中摘下一个 slub 分配对象
+ * 随后将摘下的 slub 放入 cpu 本地缓存 kmem_cache_cpu 中缓存，后续分配对象直接就会 cpu 缓存中分配
+ */
+static inline void *acquire_slab(struct kmem_cache *s,
+        struct kmem_cache_node *n, struct page *page,
+        int mode, int *objects)
+{
+    void *freelist;
+    unsigned long counters;
+    struct page new;
+
+    lockdep_assert_held(&n->list_lock);
+    // page 表示即将从 kmem_cache_node 的 partial 列表摘下的 slub，获取 slub 中的空闲对象列表 freelist
+    freelist = page->freelist;
+    counters = page->counters;
+    new.counters = counters;
+    // objects 存放该 slub 中还剩多少空闲对象
+    *objects = new.objects - new.inuse;
+    /* mode = true 表示将 slub 摘下之后填充到 kmem_cache_cpu 缓存中
+     * mode = false 表示将 slub 摘下之后填充到 kmem_cache_cpu 缓存的 partial 列表中
+     */
+    if (mode) {
+        new.inuse = page->objects;
+        new.freelist = NULL;
+    } else {
+        new.freelist = freelist;
+    }
+    // slub 放入 kmem_cache_cpu 之后需要冻结，其他 cpu 不能从这里分配对象，只能释放对象
+    new.frozen = 1;
+    // 更新 slub （page表示）中的 freelist 和 counters
+    if (!__cmpxchg_double_slab(s, page,
+            freelist, counters,
+            new.freelist, new.counters,
+            "acquire_slab"))
+        return NULL;
+    // 将 slub （page表示）从 kmem_cache_node 的 partial 列表上摘下
+    remove_partial(n, page);
+    // 返回 slub 中的空闲对象列表
+    return freelist;
+}
+
+static struct page *new_slab(struct kmem_cache *s, gfp_t flags, int node)
+{
+    return allocate_slab(s,
+        flags & (GFP_RECLAIM_MASK | GFP_CONSTRAINT_MASK), node);
+}
+
+static struct page *allocate_slab(struct kmem_cache *s, gfp_t flags, int node)
+{
+    // 用于指向从伙伴系统中申请到的内存页
+    struct page *page;
+    /* kmem_cache 结构的中的 kmem_cache_order_objects oo，表示该 slub 需要多少个内存页，以及能够容纳多少个对象
+     * kmem_cache_order_objects 的高 16 位表示需要的内存页个数，低 16 位表示能够容纳的对象个数
+     */
+    struct kmem_cache_order_objects oo = s->oo;
+    // 控制向伙伴系统申请内存的行为规范掩码
+    gfp_t alloc_gfp;
+    void *start, *p, *next;
+    int idx;
+    bool shuffle;
+    // 向伙伴系统申请 oo 中规定的内存页
+    page = alloc_slab_page(s, alloc_gfp, node, oo);
+    if (unlikely(!page)) {
+        /* 如果伙伴系统无法满足正常情况下 oo 指定的内存页个数
+         * 那么这里再次尝试用 min 中指定的内存页个数向伙伴系统申请内存页
+         * min 表示当内存不足或者内存碎片的原因无法满足内存分配时，至少要保证容纳一个对象所使用内存页个数
+         */
+        oo = s->min;
+        alloc_gfp = flags;
+        // 再次向伙伴系统申请容纳一个对象所需要的内存页（降级）
+        page = alloc_slab_page(s, alloc_gfp, node, oo);
+        if (unlikely(!page))
+            // 如果内存还是不足，则走到 out 分支直接返回 null
+            goto out;
+        stat(s, ORDER_FALLBACK);
+    }
+    // 初始化 slub 对应的 struct page 结构中的属性，获取 slub 可以容纳的对象个数
+    page->objects = oo_objects(oo);
+    // 将 slub cache 与 page 结构关联
+    page->slab_cache = s;
+    // 将 PG_slab 标识设置到 struct page 的 flag 属性中，表示该内存页 page 被 slub 所管理
+    __SetPageSlab(page);
+    // 用 0xFC 填充 slub 中的内存，用于内核对内存访问越界检查
+    kasan_poison_slab(page);
+    // 获取内存页对应的虚拟内存地址
+    start = page_address(page);
+    /* 在配置了 CONFIG_SLAB_FREELIST_RANDOM 选项的情况下
+     * 会在 slub 的空闲对象中以随机的顺序初始化 freelist 列表
+     * 返回值 shuffle = true 表示随机初始化 freelist，shuffle = false 表示按照正常的顺序初始化 freelist    
+     */
+    shuffle = shuffle_freelist(s, page);
+    // shuffle = false 则按照正常的顺序来初始化 freelist
+    if (!shuffle) {
+        /* 获取 slub 第一个空闲对象的真正起始地址
+         * slub 可能配置了 SLAB_RED_ZONE，这样会在 slub 对象内存空间两侧填充 red zone，防止内存访问越界
+         * 这里需要跳过 red zone 获取真正存放对象的内存地址
+         */
+        start = fixup_red_left(s, start);
+        // 填充对象的内存区域以及初始化空闲对象
+        start = setup_object(s, page, start);
+        // 用 slub 中的第一个空闲对象作为 freelist 的头结点，而不是随机的一个空闲对象
+        page->freelist = start;
+        // 从 slub 中的第一个空闲对象开始，按照正常的顺序通过对象的 freepointer 串联起 freelist
+        for (idx = 0, p = start; idx < page->objects - 1; idx++) {
+            // 获取下一个对象的内存地址
+            next = p + s->size;
+            // 填充下一个对象的内存区域以及初始化
+            next = setup_object(s, page, next);
+            // 通过 p 的 freepointer 指针指向 next，设置 p 的下一个空闲对象为 next
+            set_freepointer(s, p, next);
+            // 通过循环遍历，就把 slub 中的空闲对象按照正常顺序串联在 freelist 中了
+            p = next;
+        }
+        // freelist 中的尾结点的 freepointer 设置为 null
+        set_freepointer(s, p, NULL);
+    }
+    // slub 的初始状态 inuse 的值为所有空闲对象个数
+    page->inuse = page->objects;
+    // slub 被创建出来之后，需要放入 cpu 本地缓存 kmem_cache_cpu 中
+    page->frozen = 1;
+
+out:
+    if (!page)
+        return NULL;
+    /* 更新 page 所在 numa 节点在 slab cache 中的缓存 kmem_cache_node 结构中的相关计数
+     * kmem_cache_node 中包含的 slub 个数加 1，包含的总对象个数加 page->objects
+     */
+    inc_slabs_node(s, page_to_nid(page), page->objects);
+    return page;
+}
+
+static inline struct page *alloc_slab_page(struct kmem_cache *s,
+        gfp_t flags, int node, struct kmem_cache_order_objects oo)
+{
+    struct page *page;
+    unsigned int order = oo_order(oo);
+
+    if (node == NUMA_NO_NODE)
+        page = alloc_pages(flags, order);
+    else
+        page = __alloc_pages_node(node, flags, order);
+
+    return page;
+}
+
+void *fixup_red_left(struct kmem_cache *s, void *p)
+{
+    /* 如果 slub 配置了 SLAB_RED_ZONE，则意味着需要再 slub 对象内存空间两侧填充 red zone，防止内存访问越界
+     * 这里需要跳过填充的 red zone 获取真正的空闲对象起始地址
+     */
+    if (kmem_cache_debug(s) && s->flags & SLAB_RED_ZONE)
+        p += s->red_left_pad;
+    // 如果没有配置 red zone，则直接返回对象的起始地址
+    return p;
+}
+
+// 定义在文件：/mm/kasan/kasan.h
+#define KASAN_KMALLOC_REDZONE   0xFC  /* redzone inside slub object */
+
+// 定义在文件：/mm/kasan/common.c
+void kasan_poison_slab(struct page *page)
+{
+    unsigned long i;
+    /* slub 可能包含多个内存页 page，挨个遍历这些 page
+     * 清除这些 page->flag 中的内存越界检查标记
+     * 表示当访问到这些内存页的时候临时禁止内存越界检查
+     */
+    for (i = 0; i < compound_nr(page); i++)
+        page_kasan_tag_reset(page + i);
+    // 用 0xFC 填充这些内存页的内存，用于内存访问越界检查
+    kasan_poison_shadow(page_address(page), page_size(page),
+            KASAN_KMALLOC_REDZONE);
+}
+
+static inline void inc_slabs_node(struct kmem_cache *s, int node, int objects)
+{
+    // 获取 page 所在 numa node 再 slab cache 中的缓存
+    struct kmem_cache_node *n = get_node(s, node);
+
+    if (likely(n)) {
+        // kmem_cache_node 中的 slab 计数加1
+        atomic_long_inc(&n->nr_slabs);
+        // kmem_cache_node 中包含的总对象计数加 objects
+        atomic_long_add(objects, &n->total_objects);
+    }
+}
+```
+
+##### slab freelist 初始化
+
+内核在对 slab 中的 freelist 链表初始化的时候，会有两种方式，一种是按照内存地址的顺序，一个一个的通过对象 freepointer 指针顺序串联所有空闲对象。另外一种则是通过随机的方式，随机获取空闲对象，然后通过对象的 freepointer 指针将 slab 中的空闲对象按照随机的顺序串联起来。
+
+![memory](./images/memory242.png)
+
+```c
+// 返回值为 true 表示随机的初始化 freelist，false 表示采用第一个空闲对象初始化 freelist
+static bool shuffle_freelist(struct kmem_cache *s, struct page *page)
+{
+    // 指向第一个空闲对象
+    void *start;
+    void *cur;
+    void *next;
+    unsigned long idx, pos, page_limit, freelist_count;
+    // 如果没有配置 CONFIG_SLAB_FREELIST_RANDOM 选项或者 slub 容纳的对象个数小于 2，则无需对 freelist 进行随机初始化
+    if (page->objects < 2 || !s->random_seq)
+        return false;
+    // 获取 slub 中可以容纳的对象个数
+    freelist_count = oo_objects(s->oo);
+    // 获取用于随机初始化 freelist 的随机位置
+    pos = get_random_int() % freelist_count;
+    page_limit = page->objects * s->size;
+    /* 获取 slub 第一个空闲对象的真正起始地址
+     * slub 可能配置了 SLAB_RED_ZONE，这样会在 slub 中对象内存空间两侧填充 red zone，防止内存访问越界
+     * 这里需要跳过 red zone 获取真正存放对象的内存地址
+     */
+    start = fixup_red_left(s, page_address(page));
+
+    // 根据随机位置 pos 获取第一个随机对象的距离 start 的偏移 idx，返回第一个随机对象的内存地址 cur = start + idx
+    cur = next_freelist_entry(s, page, &pos, start, page_limit,
+                freelist_count);
+    // 填充对象的内存区域以及初始化空闲对象
+    cur = setup_object(s, page, cur);
+    // 第一个随机对象作为 freelist 的头结点
+    page->freelist = cur;
+    // 以 cur 为头结点随机初始化 freelist（每一个空闲对象都是随机的）
+    for (idx = 1; idx < page->objects; idx++) {
+        // 随机获取下一个空闲对象
+        next = next_freelist_entry(s, page, &pos, start, page_limit,
+            freelist_count);
+        // 填充对象的内存区域以及初始化空闲对象
+        next = setup_object(s, page, next);
+        // 设置 cur 的下一个空闲对象为 next，next 对象的指针就是 freepointer，存放于 cur 对象的 s->offset 偏移处
+        set_freepointer(s, cur, next);
+        // 通过循环遍历，就把 slub 中的空闲对象随机的串联在 freelist 中了
+        cur = next;
+    }
+    // freelist 中的尾结点的 freepointer 设置为 null
+    set_freepointer(s, cur, NULL);
+    // 表示随机初始化 freelist
+    return true;
+}
+```
+
+##### slab 对象的初始化
+
+```c
+static void *setup_object(struct kmem_cache *s, struct page *page,
+                void *object)
+{
+    // 初始化对象的内存区域，填充相关的字节，比如填充 red zone，以及 poison 对象
+    setup_object_debug(s, page, object);
+    object = kasan_init_slab_obj(s, object);
+    // 如果 kmem_cache 中设置了对象的构造函数 ctor，则用构造函数初始化对象
+    if (unlikely(s->ctor)) {
+        kasan_unpoison_object_data(s, object);
+        // 使用用户指定的构造函数初始化对象
+        s->ctor(object);
+        // 在对象内存区域的开头用 0xFC 填充一段 KASAN_SHADOW_SCALE_SIZE 大小的区域，用于对内存访问越界的检查
+        kasan_poison_object_data(s, object);
+    }
+    return object;
+}
+
+// 定义在文件：/mm/kasan/kasan.h
+#define KASAN_KMALLOC_REDZONE   0xFC  /* redzone inside slub object */
+#define KASAN_SHADOW_SCALE_SIZE (1UL << KASAN_SHADOW_SCALE_SHIFT)
+
+void kasan_poison_object_data(struct kmem_cache *cache, void *object)
+{
+    kasan_poison_shadow(object,
+            round_up(cache->object_size, KASAN_SHADOW_SCALE_SIZE),
+            KASAN_KMALLOC_REDZONE);
+}
+
+// 定义在文件：/include/linux/poison.h
+#define SLUB_RED_INACTIVE	0xbb
+
+static void setup_object_debug(struct kmem_cache *s, struct page *page,
+                                void *object)
+{
+    /* SLAB_STORE_USER：存储最近访问该对象的 owner 信息，方便 bug 追踪
+     * SLAB_RED_ZONE：在 slub 中对象内存区域的前后填充分别填充一段 red zone 区域，防止内存访问越界
+     * __OBJECT_POISON：在对象内存区域中填充一些特定的字符，表示对象特定的状态。比如：未被分配状态
+     */
+    if (!(s->flags & (SLAB_STORE_USER|SLAB_RED_ZONE|__OBJECT_POISON)))
+        return;
+    // 初始化对象内存，比如填充 red zone，以及 poison
+    init_object(s, object, SLUB_RED_INACTIVE);
+    // 设置 SLAB_STORE_USER 起作用，初始化访问对象的所有者相关信息
+    init_tracking(s, object);
+}
+
+// 定义在文件：/include/linux/poison.h
+#define SLUB_RED_INACTIVE   0xbb
+
+// 定义在文件：/include/linux/poison.h
+#define POISON_FREE	0x6b	/* for use-after-free poisoning */
+#define	POISON_END	0xa5	/* end-byte of poisoning */
+
+static void init_object(struct kmem_cache *s, void *object, u8 val)
+{
+    // p 为真正存储对象的内存区域起始地址(不包含填充的 red zone)
+    u8 *p = object;
+    // red zone 位于真正存储对象内存区域 object size 的左右两侧，分别有一段 red zone
+    if (s->flags & SLAB_RED_ZONE)
+        // 首先使用 0xbb 填充对象左侧的 red zone，左侧 red zone 区域为对象的起始地址到 s->red_left_pad 的长度
+        memset(p - s->red_left_pad, val, s->red_left_pad);
+
+    if (s->flags & __OBJECT_POISON) {
+        // 将对象的内容用 0x6b 填充，表示该对象在 slub 中还未被使用
+        memset(p, POISON_FREE, s->object_size - 1);
+        // 对象的最后一个字节用 0xa5 填充，表示 POISON 的末尾
+        p[s->object_size - 1] = POISON_END;
+    }
+
+    /* 在对象内存区域 object size 的右侧继续用 0xbb 填充右侧 red zone
+     * 右侧 red zone 的位置为：对象真实内存区域的末尾开始一个字长的区域
+     * s->object_size 表示对象本身的内存占用，s->inuse 表示对象在 slub 管理体系下的真实内存占用（包含填充字节数）
+     * 通常会在对象内存区域末尾处填充一个字长大小的 red zone 区域
+     * 对象右侧 red zone 区域后面紧跟着的就是 freepointer
+     */
+    if (s->flags & SLAB_RED_ZONE)
+        memset(p + s->object_size, val, s->inuse - s->object_size);
+}
+```
+
+#### slab cache 内存回收及销毁
+
+![memory](./images/memory243.png)
+
+```c
+void kmem_cache_free(struct kmem_cache *s, void *x)
+{
+    // 确保指定的是 slab cache : s 为对象真正所属的 slab cache
+    s = cache_from_obj(s, x);
+    if (!s)
+        return;
+    // 将对象释放会 slab cache 中
+    slab_free(s, virt_to_head_page(x), x, NULL, 1, _RET_IP_);
+}
+
+static inline struct kmem_cache *cache_from_obj(struct kmem_cache *s, void *x)
+{
+    struct kmem_cache *cachep;
+    // 通过对象的虚拟内存地址 x 找到对象所属的 slab cache
+    cachep = virt_to_cache(x);
+    // 校验指定的 slab cache : s 是否是对象真正所属的 slab cache : cachep
+    WARN_ONCE(cachep && !slab_equal_or_root(cachep, s),
+          "%s: Wrong slab cache. %s but object is from %s\n",
+          __func__, s->name, cachep->name);
+    return cachep;
+}
+
+static inline struct kmem_cache *virt_to_cache(const void *obj)
+{
+    struct page *page;
+    // 根据对象的虚拟内存地址 *obj 找到其所在的内存页 page，如果 slub 背后是多个内存页（复合页），则返回复合页的首页 head page
+    page = virt_to_head_page(obj);
+    if (WARN_ONCE(!PageSlab(page), "%s: Object is not a Slab page!\n",
+                    __func__))
+        return NULL;
+    // 通过 page 结构中的 slab_cache 属性找到其所属的 slub
+    return page->slab_cache;
+}
+```
+
+##### fastpath
+
+```c
+static __always_inline void slab_free(struct kmem_cache *s, struct page *page,
+                      void *head, void *tail, int cnt,
+                      unsigned long addr)
+{
+    if (slab_free_freelist_hook(s, &head, &tail))
+        do_slab_free(s, page, head, tail, cnt, addr);
+}
+
+static __always_inline void do_slab_free(struct kmem_cache *s,
+                struct page *page, void *head, void *tail,
+                int cnt, unsigned long addr)
+{
+    void *tail_obj = tail ? : head;
+    struct kmem_cache_cpu *c;
+    // slub 中对象分配与释放流程的全局事务 id，既可以用来标识同一个分配或者释放的事务流程，也可以用来标识区分所属 cpu 本地缓存
+    unsigned long tid;
+redo:
+    /* 接下来需要获取 slab cache 的 cpu 本地缓存
+     * 这里的 do..while 循环是要保证获取到的 cpu 本地缓存 c 是属于执行进程的当前 cpu
+     * 因为进程可能由于抢占或者中断的原因被调度到其他 cpu 上执行，所以需要确保两者的 tid 是否一致
+     */
+    do {
+        // 获取执行当前进程的 cpu 中的 tid 字段
+        tid = this_cpu_read(s->cpu_slab->tid);
+        // 获取 cpu 本地缓存 cpu_slab
+        c = raw_cpu_ptr(s->cpu_slab);
+        // 如果两者的 tid 字段不一致，说明进程已经被调度到其他 cpu 上了，需要再次获取正确的 cpu 本地缓存
+    } while (IS_ENABLED(CONFIG_PREEMPT) &&
+         unlikely(tid != READ_ONCE(c->tid)));
+
+    /* 如果释放对象所属的 slub （page 表示）正好是 cpu 本地缓存的 slub
+     * 那么直接将对象释放到 cpu 缓存的 slub 中即可，这里就是快速释放路径 fastpath
+     */
+    if (likely(page == c->page)) {
+        // 将对象释放至 cpu 本地缓存 freelist 中的头结点处，释放对象中的 freepointer 指向原来的 c->freelist
+        set_freepointer(s, tail_obj, c->freelist);
+        // cas 更新 cpu 本地缓存 s->cpu_slab 中的 freelist，以及 tid
+        if (unlikely(!this_cpu_cmpxchg_double(
+                s->cpu_slab->freelist, s->cpu_slab->tid,
+                c->freelist, tid,
+                head, next_tid(tid)))) {
+
+            note_cmpxchg_failure("slab_free", s, tid);
+            goto redo;
+        }
+        stat(s, FREE_FASTPATH);
+    } else
+        // 如果当前释放对象并不在 cpu 本地缓存中，那么就进入慢速释放路径 slowpath
+        __slab_free(s, page, head, tail_obj, cnt, addr);
+
+}
+```
+
+##### slowpath
+
+在将对象释放回对应的 slab 中之前，内核需要首先清理一下对象所占的内存，重新填充对象的内存布局恢复到初始未使用状态。因为对象所占的内存此时包含了很多已经被使用过的无用信息。这项工作内核在 `free_debug_processing` 函数中完成。在将对象所在内存恢复到初始状态之后，内核首先会将对象直接释放回其所属的 slab 中，并调整 slab 结构 page 的相关属性。接下来就到复杂的处理部分了，内核会在这里处理多种场景，并改变 slab 在 slab cache 架构中的位置。
+
+1. 如果 slab 本来就在 slab cache 本地 cpu 缓存 `kmem_cache_cpu->partial` 链表中，那么对象在释放之后，slab 的位置不做任何改变。
+2. 如果 slab 不在 `kmem_cache_cpu->partial` 链表中，并且该 slab 由于对象的释放刚好由一个 full slab 变为了一个 partial slab，为了利用局部性的优势，内核需要将该 slab 插入到 `kmem_cache_cpu->partial` 链表中。
+3. 如果 slab 不在 `kmem_cache_cpu->partial` 链表中，并且该 slab 由于对象的释放刚好由一个 partial slab 变为了一个 empty slab，说明该 slab 并不是很活跃，内核会将该 slab 放入对应 NUMA 节点缓存 `kmem_cache_node->partial` 链表中。
+4. 如果不符合第 2, 3 种场景，但是 slab 本来就在对应的 NUMA 节点缓存 `kmem_cache_node->partial` 链表中，那么对象在释放之后，slab 的位置不做任何改变。
+
+```c
+static void __slab_free(struct kmem_cache *s, struct page *page,
+            void *head, void *tail, int cnt,
+            unsigned long addr)
+
+{
+    // 用于指向对象释放回 slub 之前，slub 的 freelist
+    void *prior;
+    // 对象所属的 slub 之前是否在本地 cpu 缓存 partial 链表中
+    int was_frozen;
+    // 后续会对 slub 对应的 page 结构相关属性进行修改，修改后的属性会临时保存在 new 中，后面通过 cas 替换
+    struct page new;
+    unsigned long counters;
+    struct kmem_cache_node *n = NULL;
+    stat(s, FREE_SLOWPATH);
+
+    // free_debug_processing 中会调用 init_object，清理对象内存无用信息，重新恢复对象内存布局到初始状态
+    if (kmem_cache_debug(s) &&
+     !free_debug_processing(s, page, head, tail, cnt, addr))
+        return;
+
+    do {
+        // 获取 slub 中的空闲对象列表，prior = null 表示此时 slub 是一个 full slub，意思就是该 slub 中的对象已经全部被分配出去了
+        prior = page->freelist;
+        counters = page->counters;
+        // 将释放的对象插入到 freelist 的头部，将对象释放回 slub，将 tail 对象的 freepointer 设置为 prior
+        set_freepointer(s, tail, prior);
+        /* 将原有 slab 的相应属性赋值给 new page。由于page 结构中的 counters 是和 inuse，frozen 共用同一块内存的，
+         * 将原有 slab 的 counters 属性赋值给 new.counters 的一瞬间，counters 所在的内存块也就赋值到 new page 的 union 结构中了。
+         * 而 inuse，frozen 属性的值也在这个内存块中，所以原有 slab 中的 inuse，frozen 属性也就跟着一起赋值到 new page 的对应属性中了。
+         */ 
+        new.counters = counters;
+        // 获取原来 slub 中的 frozen 状态，是否在 cpu 缓存 partial 链表中
+        was_frozen = new.frozen;
+        // inuse 表示 slub 已经分配出去的对象个数，这里是释放 cnt 个对象，所以 inuse 要减去 cnt
+        new.inuse -= cnt;
+        /* !new.inuse 表示此时 slub 变为了一个 empty slub，意思就是该 slub 中的对象还没有分配出去，全部在 slub 中
+         * !prior 表示由于本次对象的释放，slub 刚刚从一个 full slub 变成了一个 partial slub
+         * (意思就是该 slub 中的对象部分分配出去了，部分没有分配出去)，!was_frozen 表示该 slub 不在 cpu 本地缓存中
+         */
+        if ((!new.inuse || !prior) && !was_frozen) {
+            /* 注意：进入该分支的 slub 之前都不在 cpu 本地缓存中，如果配置了 CONFIG_SLUB_CPU_PARTIAL 选项，
+             * 那么表示 cpu 本地缓存 kmem_cache_cpu 结构中包含 partial 列表，用于 cpu 缓存部分分配的 slub
+             */
+            if (kmem_cache_has_cpu_partial(s) && !prior) {
+                /* 如果 kmem_cache_cpu 包含 partial 列表并且该 slub 刚刚由 full slub 变为 partial slub
+                 * 冻结该 slub，后续会将该 slub 插入到 kmem_cache_cpu 的 partial 列表中
+                 */
+                new.frozen = 1;
+
+            } else { 
+                /* 如果 kmem_cache_cpu 中没有配置 partial 列表，那么直接释放至 kmem_cache_node 中
+                 * 或者该 slub 由一个 partial slub 变为了 empty slub，调整 slub 的位置到 kmem_cache_node->partial 链表中
+                 */
+                n = get_node(s, page_to_nid(page));
+                // 后续会操作 kmem_cache_node 中的 partial 列表，所以这里需要获取 list_lock
+                spin_lock_irqsave(&n->list_lock, flags);
+
+            }
+        }
+    /* cas 更新 slub 中的 freelist 以及 counters。page->counters 的作用只是为了指向 inuse，frozen 所在的内存，
+     * 方便在 cmpxchg_double_slab 中同时原子地更新这两个属性。
+     */
+    } while (!cmpxchg_double_slab(s, page,
+        prior, counters,
+        head, new.counters,
+        "__slab_free"));
+
+    /* 该分支要处理的场景是：
+     * 1: 该 slub 原来不在 cpu 本地缓存的 partial 列表中（!was_frozen），但是该 slub 刚刚从 full slub 变为了 partial slub，
+     * 需要放入 cpu->partial 列表中
+     * 2: 该 slub 原来就在 cpu 本地缓存的 partial 列表中，直接将对象释放回 slub 即可
+     */
+    if (likely(!n)) {
+        // 处理场景 1
+        if (new.frozen && !was_frozen) {
+            // 将 slub 插入到 kmem_cache_cpu 中的 partial 列表中
+            put_cpu_partial(s, page, 1);
+            stat(s, CPU_PARTIAL_FREE);
+        }
+        
+        // 处理场景2，因为之前已经通过 set_freepointer 将对象释放回 slub 了，这里只需要记录 slub 状态即可
+        if (was_frozen)
+            stat(s, FREE_FROZEN);
+        return;
+    }
+    
+    /* 后续的逻辑就是处理需要将 slub 放入 kmem_cache_node 中的 partial 列表的情形
+     * 在将 slub 放入 node 缓存之前，需要判断 node 缓存的 nr_partial 是否超过了指定阈值 min_partial（位于 kmem_cache 结构）
+     * nr_partial 表示 kmem_cache_node 中 partial 列表中缓存的 slub 个数
+     * min_partial 表示 slab cache 规定 kmem_cache_node 中 partial 列表可以容纳的 slub 最大个数
+     * 如果 nr_partial 超过了最大阈值 min_partial，则不能放入 kmem_cache_node 里
+     */
+    if (unlikely(!new.inuse && n->nr_partial >= s->min_partial))
+        // 如果 slub 变为了一个 empty slub 并且 nr_partial 超过了最大阈值 min_partial，跳转到 slab_empty 分支，将 slub 释放回伙伴系统中
+        goto slab_empty;
+
+    // 如果 cpu 本地缓存中没有配置 partial 列表并且 slub 刚刚从 full slub 变为 partial slub，则将 slub 插入到 kmem_cache_node 中
+    if (!kmem_cache_has_cpu_partial(s) && unlikely(!prior)) {
+        remove_full(s, n, page);
+        add_partial(n, page, DEACTIVATE_TO_TAIL);
+        stat(s, FREE_ADD_PARTIAL);
+    }
+    spin_unlock_irqrestore(&n->list_lock, flags);
+    // 剩下的情况均属于 slub 原来就在 kmem_cache_node 中的 partial 列表中直接将对象释放回 slub 即可，无需改变 slub 的位置，直接返回
+    return;
+
+slab_empty:
+    // 该分支处理的场景是： slub 太多了，将 empty slub 释放会伙伴系统，首先将 slub 从对应的管理链表上删除
+    if (prior) {
+        /* Slab on the partial list */
+        remove_partial(n, page);
+        stat(s, FREE_REMOVE_PARTIAL);
+    } else {
+        /* Slab must be on the full list */
+        remove_full(s, n, page);
+    }
+    spin_unlock_irqrestore(&n->list_lock, flags);
+    stat(s, FREE_SLAB);
+    // 释放 slub 回伙伴系统，底层调用 __free_pages 将 slub 所管理的所有 page 释放回伙伴系统
+    discard_slab(s, page);
+}
+
+static void put_cpu_partial(struct kmem_cache *s, struct page *page, int drain)
+{
+// 只有配置了 CONFIG_SLUB_CPU_PARTIAL 选项，kmem_cache_cpu 中才有会 partial 列表
+#ifdef CONFIG_SLUB_CPU_PARTIAL
+    // 指向原有 kmem_cache_cpu 中的 partial 列表
+    struct page *oldpage;
+    // slub 所在管理列表中的 slub 个数，这里的列表是指 partial 列表
+    int pages;
+    // slub 所在管理列表中的包含的空闲对象总数，这里的列表是指 partial 列表，内核会将列表总体的信息存放在列表首页 page 的相关字段中
+    int pobjects;
+    // 禁止抢占
+    preempt_disable();
+    do {
+        pages = 0;
+        pobjects = 0;
+        // 获取 slab cache 中原有的 cpu 本地缓存 partial 列表首页
+        oldpage = this_cpu_read(s->cpu_slab->partial);
+        /* 如果 partial 列表不为空，则需要判断 partial 列表中所有 slub 包含的空闲对象总数是否超过了 s->cpu_partial 规定的阈值
+         * 超过 s->cpu_partial 则需要将 kmem_cache_cpu->partial 列表中原有的所有 slub 转移到 kmem_cache_node->partial 列表中
+         * 转移之后，再把当前 slub 插入到 kmem_cache_cpu->partial 列表中
+         * 如果没有超过 s->cpu_partial ，则无需转移直接插入
+         */
+        if (oldpage) {
+            // 从 partial 列表首页中获取列表中包含的空闲对象总数
+            pobjects = oldpage->pobjects;
+            // 从 partial 列表首页中获取列表中包含的 slub 总数
+            pages = oldpage->pages;
+
+            if (drain && pobjects > s->cpu_partial) {
+                unsigned long flags;
+                // 关闭中断，防止并发访问
+                local_irq_save(flags);
+                /* partial 列表中所包含的空闲对象总数 pobjects 超过了 s->cpu_partial 规定的阈值
+                 * 则需要将现有 partial 列表中的所有 slub 转移到相应的 kmem_cache_node->partial 列表中
+                 */
+                unfreeze_partials(s, this_cpu_ptr(s->cpu_slab));
+                // 恢复中断
+                local_irq_restore(flags);
+                // 重置 partial 列表
+                oldpage = NULL;
+                pobjects = 0;
+                pages = 0;
+                stat(s, CPU_PARTIAL_DRAIN);
+            }
+        }
+        // 无论 kmem_cache_cpu->partial 列表中的 slub 是否需要转移，释放对象所在的 slub 都需要填加到 kmem_cache_cpu->partial 列表中
+        pages++;
+        pobjects += page->objects - page->inuse;
+
+        page->pages = pages;
+        page->pobjects = pobjects;
+        page->next = oldpage;
+        // 通过 cas 将 slub 插入到 partial 列表的头部
+    } while (this_cpu_cmpxchg(s->cpu_slab->partial, oldpage, page)
+                                != oldpage);
+
+    // s->cpu_partial = 0 表示 kmem_cache_cpu->partial 列表不能存放 slub，将释放对象所在的 slub 转移到 kmem_cache_node->partial 列表中
+    if (unlikely(!s->cpu_partial)) {
+        unsigned long flags;
+        local_irq_save(flags);
+        unfreeze_partials(s, this_cpu_ptr(s->cpu_slab));
+        local_irq_restore(flags);
+    }
+    preempt_enable();
+#endif  /* CONFIG_SLUB_CPU_PARTIAL */
+}
+```
+
+如何知道 `kmem_cache_cpu->partial` 链表所包含的空闲对象总数到底是多少呢？这就用到了 struct page 结构中的两个重要属性：
+
+```c
+struct page {
+      // slab 所在链表中的包含的 slab 总数
+      int pages;  
+      // slab 所在链表中包含的对象总数
+      int pobjects; 
+}
+```
+
+slab 在内核中的数据结构用 `struct page` 中的相关结构体表示，slab 在 slab cache 架构中一般是由 `kmem_cache_cpu->partial` 链表和 `kmem_cache_node->partial` 链表来组织管理。如何知道 partial 链表中包含多少个 slab ？包含多少个空闲对象呢？答案是内核会将 partial 链表中的这些总体统计信息存储在链表首个 slab 结构中，也就是说存储在首个 page 结构中的 pages 属性和 pobjects 属性中。
+
+```c
+// 将 kmem_cache_cpu->partial 列表中包含的 slub unfreeze，并转移到对应的 kmem_cache_node->partial 列表中
+static void unfreeze_partials(struct kmem_cache *s,
+        struct kmem_cache_cpu *c)
+{
+#ifdef CONFIG_SLUB_CPU_PARTIAL
+    struct kmem_cache_node *n = NULL, *n2 = NULL;
+    struct page *page, *discard_page = NULL;
+    // 挨个遍历 kmem_cache_cpu->partial 列表，将列表中的 slub 转移到对应 kmem_cache_node->partial 列表中
+    while ((page = c->partial)) {
+        struct page new;
+        struct page old;
+        // 将当前遍历到的 slub 从 kmem_cache_cpu->partial 列表摘下
+        c->partial = page->next;
+        // 获取当前 slub 所在的 numa 节点对应的 kmem_cache_node 缓存
+        n2 = get_node(s, page_to_nid(page));
+        // 如果和上一个转移的 slub 所在的 numa 节点不一样，则需要释放上一个 numa 节点的 list_lock，并对当前 numa 节点的 list_lock 加锁
+        if (n != n2) {
+            if (n)
+                spin_unlock(&n->list_lock);
+
+            n = n2;
+            spin_lock(&n->list_lock);
+        }
+
+        do {
+
+            old.freelist = page->freelist;
+            old.counters = page->counters;
+            VM_BUG_ON(!old.frozen);
+
+            new.counters = old.counters;
+            new.freelist = old.freelist;
+            // unfrozen 当前 slub，因为即将被转移到对应的 kmem_cache_node->partial 列表
+            new.frozen = 0;
+            // cas 更新当前 slub 的 freelist，frozen 属性
+        } while (!__cmpxchg_double_slab(s, page,
+                old.freelist, old.counters,
+                new.freelist, new.counters,
+                "unfreezing slab"));
+        /* 因为 kmem_cache_node->partial 列表中所包含的 slub 个数是受 s->min_partial 阈值限制的
+         * 所以这里还需要检查 nr_partial 是否超过了 min_partial
+         * 如果当前被转移的 slub 是一个 empty slub 并且 nr_partial 超过了 min_partial 的限制，则需要将 slub 释放回伙伴系统中
+         * 但仍会存在 partial slub 数量依然超过 min_partial 的情况
+         */
+        if (unlikely(!new.inuse && n->nr_partial >= s->min_partial)) {
+            // discard_page 用于将需要释放回伙伴系统的 slub 串联起来，后续统一将 discard_page 链表中的 slub 释放回伙伴系统
+            page->next = discard_page;
+            discard_page = page;
+        } else {
+            /* 其他情况，只要 slub 不为 empty ，不管 nr_partial 是否超过了 min_partial
+             * 都需要将 slub 转移到对应 kmem_cache_node->partial 列表的末尾
+             */
+            add_partial(n, page, DEACTIVATE_TO_TAIL);
+            stat(s, FREE_ADD_PARTIAL);
+        }
+    }
+
+    if (n)
+        spin_unlock(&n->list_lock);
+    // 将 discard_page 链表中的 slub 统一释放回伙伴系统
+    while (discard_page) {
+        page = discard_page;
+        discard_page = discard_page->next;
+
+        stat(s, DEACTIVATE_EMPTY);
+        // 底层调用 __free_pages 将 slub 所管理的所有 page 释放回伙伴系统
+        discard_slab(s, page);
+        stat(s, FREE_SLAB);
+    }
+#endif  /* CONFIG_SLUB_CPU_PARTIAL */
+}
+```
+
+##### slab cache 的销毁
+
+slab cache 销毁的核心步骤如下：
+
+1. 首先需要释放 slab cache 在所有 cpu 中的缓存 `kmem_cache_cpu` 中占用的资源，包括被 cpu 缓存的 slab (`kmem_cache_cpu->page`)，以及 `kmem_cache_cpu->partial` 链表中缓存的所有 slab，将它们统统归还到伙伴系统中。
+2. 释放 slab cache 在所有 NUMA 节点中的缓存 `kmem_cache_node` 占用的资源，也就是将 `kmem_cache_node->partial` 链表中缓存的所有 slab ，统统释放回伙伴系统中。
+3. 在 sys 文件系统中移除 `/sys/kernel/slab/<cacchename>` 节点相关信息。
+4. 从 slab cache 的全局列表中删除该 slab cache。
+5. 释放 `kmem_cache_cpu` 结构，`kmem_cache_node` 结构，`kmem_cache` 结构。
+
+![memory](./images/memory244.png)
+
+```c
+void kmem_cache_destroy(struct kmem_cache *s)
+{
+    int err;
+
+    if (unlikely(!s))
+        return;
+
+    // 获取 cpu_hotplug_lock，防止 cpu 热插拔改变 online cpu map
+    get_online_cpus();
+    // 获取 mem_hotplug_lock，防止访问内存的时候进行内存热插拔
+    get_online_mems();
+    // 获取 slab cache 链表的全局互斥锁
+    mutex_lock(&slab_mutex);
+    // 将 slab cache 的引用技术减 1
+    s->refcount--;
+    // 判断 slab cache 是否还存在其他地方的引用
+    if (s->refcount)
+        // 如果该 slab cache 还存在引用，则不能销毁，跳转到 out_unlock 分支
+        goto out_unlock;
+    // 销毁 memory cgroup 相关的 cache
+    err = shutdown_memcg_caches(s);
+    if (!err)
+        // slab cache 销毁的核心函数，销毁逻辑就封装在这里
+        err = shutdown_cache(s);
+
+    if (err) {
+        pr_err("kmem_cache_destroy %s: Slab cache still has objects\n",
+               s->name);
+        dump_stack();
+    }
+out_unlock:
+    // 释放相关的自旋锁和信号量
+    mutex_unlock(&slab_mutex);
+
+    put_online_mems();
+    put_online_cpus();
+}
+
+static int shutdown_cache(struct kmem_cache *s)
+{
+    // 这里会释放 slab cache 占用的所有资源
+    if (__kmem_cache_shutdown(s) != 0)
+        return -EBUSY;
+    // 从 slab cache 的全局列表中删除该 slab cache
+    list_del(&s->list);
+    // 释放 sys 文件系统中移除 /sys/kernel/slab/name 节点的相关资源
+    sysfs_slab_unlink(s);
+    sysfs_slab_release(s);
+    // 释放 kmem_cache_cpu 结构，kmem_cache_node 结构，释放 kmem_cache 结构
+    slab_kmem_cache_release(s);
+
+    }
+
+    return 0;
+}
+
+/*
+ * Release all resources used by a slab cache.
+ */
+int __kmem_cache_shutdown(struct kmem_cache *s)
+{
+    int node;
+    struct kmem_cache_node *n;
+    // 释放 slab cache 本地 cpu 缓存 kmem_cache_cpu 中缓存的 slub 以及 partial 列表中的 slub，统统归还给伙伴系统
+    flush_all(s);
+
+    // 释放 slab cache 中 numa 节点缓存 kmem_cache_node 中 partial 列表上的所有 slub
+    for_each_kmem_cache_node(s, node, n) {
+        free_partial(s, n);
+        if (n->nr_partial || slabs_node(s, node))
+            return 1;
+    }
+    // 在 sys 文件系统中移除 /sys/kernel/slab/name 节点相关信息
+    sysfs_slab_remove(s);
+    return 0;
+}
+
+// 释放 kmem_cache_cpu 中占用的所有内存资源
+static void flush_all(struct kmem_cache *s)
+{
+    /* 遍历每个 cpu，通过 has_cpu_slab 函数检查 cpu 上是否还有 slab cache 的相关缓存资源
+     * 如果有，则调用 flush_cpu_slab 进行资源的释放
+     */
+    on_each_cpu_cond(has_cpu_slab, flush_cpu_slab, s, 1, GFP_ATOMIC);
+}
+
+static bool has_cpu_slab(int cpu, void *info)
+{
+    struct kmem_cache *s = info;
+    // 获取 cpu 在 slab cache 上的本地缓存
+    struct kmem_cache_cpu *c = per_cpu_ptr(s->cpu_slab, cpu);
+    // 判断 cpu 本地缓存中是否还有缓存的 slub
+    return c->page || slub_percpu_partial(c);
+}
+
+static void flush_cpu_slab(void *d)
+{
+    struct kmem_cache *s = d;
+    // 释放 slab cache 在 cpu 上的本地缓存资源
+    __flush_cpu_slab(s, smp_processor_id());
+}
+
+static inline void __flush_cpu_slab(struct kmem_cache *s, int cpu)
+{
+    struct kmem_cache_cpu *c = per_cpu_ptr(s->cpu_slab, cpu);
+
+    if (c->page)
+        // 释放 cpu 本地缓存的 slub 到伙伴系统
+        flush_slab(s, c);
+    // 将 cpu 本地缓存中的 partial 列表里的 slub 全部释放回伙伴系统
+    unfreeze_partials(s, c);
+}
+
+void slab_kmem_cache_release(struct kmem_cache *s)
+{
+    // 释放 slab cache 中的 kmem_cache_cpu 结构以及 kmem_cache_node 结构
+    __kmem_cache_release(s);
+    // 最后释放 slab cache 的核心数据结构 kmem_cache
+    kmem_cache_free(kmem_cache, s);
+}
+```
+
+### kmalloc
+
+kmalloc 内存池体系的底层基石是基于 slab alloactor 体系构建的，其本质其实就是各种不同尺寸的通用 slab cache。
+
+![memory](./images/memory245.png)
+
+可以通过 `cat /proc/slabinfo` 命令来查看系统中不同尺寸的通用 slab cache：
+
+![memory](./images/memory246.png)
+
+`kmalloc-32` 是专门为 32 字节的内存块定制的 slab cache，用于应对 32 字节小内存块的分配与释放。`kmalloc-64` 是专门为 64 字节的内存块定制的 slab cache，`kmalloc-1k` 是专门为 1K 大小的内存块定制的 slab cache 等等。
+
+#### kmalloc 通用内存池
+
+内核将这些不同尺寸的 slab cache 分类信息定义在 `kmalloc_info[]` 数组中，数组中的元素类型为 `kmalloc_info_struct` 结构，里边定义了对应尺寸通用内存池的相关信息。
+
+```c
+const struct kmalloc_info_struct kmalloc_info[];
+
+/* A table of kmalloc cache names and sizes */
+extern const struct kmalloc_info_struct {
+    // slab cache 的名字
+    const char *name;
+    // slab cache 提供的内存块大小，单位为字节
+    unsigned int size;
+} kmalloc_info[];
+
+const struct kmalloc_info_struct kmalloc_info[] __initconst = {
+    {NULL,                      0},     {"kmalloc-96",             96},
+    {"kmalloc-192",           192},     {"kmalloc-8",               8},
+    {"kmalloc-16",             16},     {"kmalloc-32",             32},
+    {"kmalloc-64",             64},     {"kmalloc-128",           128},
+    {"kmalloc-256",           256},     {"kmalloc-512",           512},
+    {"kmalloc-1k",           1024},     {"kmalloc-2k",           2048},
+    {"kmalloc-4k",           4096},     {"kmalloc-8k",           8192},
+    {"kmalloc-16k",         16384},     {"kmalloc-32k",         32768},
+    {"kmalloc-64k",         65536},     {"kmalloc-128k",       131072},
+    {"kmalloc-256k",       262144},     {"kmalloc-512k",       524288},
+    {"kmalloc-1M",        1048576},     {"kmalloc-2M",        2097152},
+    {"kmalloc-4M",        4194304},     {"kmalloc-8M",        8388608},
+    {"kmalloc-16M",      16777216},     {"kmalloc-32M",      33554432},
+    {"kmalloc-64M",      67108864}
+};
+```
+
+从 kmalloc_info[] 数组中可以看出，kmalloc 内存池体系理论上最大可以支持 64M 尺寸大小的通用内存池。**kmalloc_info[] 数组中的 index 有一个特点**，从 index = 3 开始一直到数组的最后一个 index，这其中的每一个 index 都表示其对应的 kmalloc_info[index] 指向的通用 slab cache 尺寸，也就是说 kmalloc 内存池体系中的每个通用 slab cache 中内存块的尺寸由其所在的 kmalloc_info[] 数组 index 决定，对应内存块大小为：`2^index` 字节，比如：
+
+- kmalloc_info[3] 对应的通用 slab cache 中所管理的内存块尺寸为 8 字节。
+- kmalloc_info[5] 对应的通用 slab cache 中所管理的内存块尺寸为 32 字节。
+- kmalloc_info[9] 对应的通用 slab cache 中所管理的内存块尺寸为 512 字节。
+- kmalloc_info[index] 对应的通用 slab cache 中所管理的内存块尺寸为 2^index 字节。
+
+但是这里的 index = 1 和 index = 2 是个例外，内核单独支持了 kmalloc-96 和 kmalloc-192 这两个通用 slab cache。它们分别管理了 96 字节大小和 192 字节大小的通用内存块。这些内存块的大小都不是 2 的次幂。那么内核为什么会单独支持这两个尺寸而不是其他尺寸的通用 slab cache 呢？因为在内核中，对于内存块的申请需求大部分情况下都在 96 字节或者 192 字节附近，如果内核不单独支持这两个尺寸的通用 slab cache。那么当内核申请一个尺寸在 64 字节到 96 字节之间的内存块时，内核会直接从 kmalloc-128 中分配一个 128 字节大小的内存块，这样就导致了内存块内部碎片比较大，浪费宝贵的内存资源。同理，当内核申请一个尺寸在 128 字节到 192 字节之间的内存块时，内核会直接从 kmalloc-256 中分配一个 256 字节大小的内存块。当内核申请超过 256 字节的内存块时，一般都是会按照 2 的次幂来申请的，所以这里只需要单独支持 kmalloc-96 和 kmalloc-192 即可。
+
+#### kmalloc 内存池选取规则
+
+既然 kmalloc 体系中通用内存块的尺寸分布信息可以通过一个数组 kmalloc_info[] 来定义，那么同理，最佳内存块尺寸的选取规则也可以被定义在一个数组中。内核通过定义一个 `size_index[24]` 数组来存放申请**内存块大小在 192 字节以下**的 kmalloc 内存池选取规则。其中 `size_index[24]` 数组中每个元素后面跟的注释部分为内核要申请的字节数，`size_index[24]` 数组中每个元素表示最佳合适尺寸的通用 slab cache 在 kmalloc_info[] 数组中的索引。
+
+```c
+static u8 size_index[24] __ro_after_init = {
+    3,  /* 8 */
+    4,  /* 16 */
+    5,  /* 24 */
+    5,  /* 32 */
+    6,  /* 40 */
+    6,  /* 48 */
+    6,  /* 56 */
+    6,  /* 64 */
+    1,  /* 72 */
+    1,  /* 80 */
+    1,  /* 88 */
+    1,  /* 96 */
+    7,  /* 104 */
+    7,  /* 112 */
+    7,  /* 120 */
+    7,  /* 128 */
+    2,  /* 136 */
+    2,  /* 144 */
+    2,  /* 152 */
+    2,  /* 160 */
+    2,  /* 168 */
+    2,  /* 176 */
+    2,  /* 184 */
+    2   /* 192 */
+};
+```
+
+- size_index[0] 存储的信息表示，如果内核申请的内存块低于 8 字节时，那么 kmalloc 将会到 kmalloc_info[3] 所指定的通用 slab cache —— kmalloc-8 中分配一个 8 字节大小的内存块。
+- size_index[16] 存储的信息表示，如果内核申请的内存块在 128 字节到 136 字节之间时，那么 kmalloc 将会到 kmalloc_info[2] 所指定的通用 slab cache —— kmalloc-192 中分配一个 192 字节大小的内存块。
+- 同样的道理，申请 144，152，160 ..... 192 等字节尺寸的内存块对应的最佳 slab cache 选取规则也是如此，都是通过 size_index 数组中的值找到 kmalloc_info 数组的索引，然后通过 kmalloc_info[index] 指定的 slab cache，分配对应尺寸的内存块。
+
+**size_index 数组只是定义申请内存块在 192 字节以下的 kmalloc 内存池选取规则**，当申请内存块的尺寸超过 192 字节时，内核会通过 fls 函数来计算 kmalloc_info 数组中的通用 slab cache 索引。
+
+#### kmalloc 内存池的整体架构
+
+![memory](./images/memory247.png)
+
+kmalloc 体系所能支持的内存块尺寸范围由 KMALLOC_SHIFT_LOW 和 KMALLOC_SHIFT_HIGH 决定，它们被定义在 `/include/linux/slab.h` 文件中：
+
+```c
+#ifdef CONFIG_SLUB
+// slub 最大支持分配 2页 大小的对象，对应的 kmalloc 内存池中内存块尺寸最大就是 2页
+// 超过 2页 大小的内存块直接向伙伴系统申请
+#define KMALLOC_SHIFT_HIGH  (PAGE_SHIFT + 1)
+#define KMALLOC_SHIFT_LOW   3
+
+#define PAGE_SHIFT      12
+```
+
+其中 kmalloc 支持的最小内存块尺寸为：`2^KMALLOC_SHIFT_LOW`，在 slub 实现中 KMALLOC_SHIFT_LOW = 3，kmalloc 支持的最小内存块尺寸为 8 字节大小。kmalloc 支持的最大内存块尺寸为：`2^KMALLOC_SHIFT_HIGH`，在 slub 实现中 KMALLOC_SHIFT_HIGH = 13，kmalloc 支持的最大内存块尺寸为 8K ，也就是两个内存页大小。所以，实际上，在内核的 slub 实现中，kmalloc 所能支持的内存块大小在 8 字节到 8K 之间。
+
+![memory](./images/memory248.png)
+
+**kmalloc 内存池中的内存来自于 ZONE_DMA 和 ZONE_NORMAL 物理内存区域**，也就是内核虚拟内存空间中的直接映射区域。kmalloc 内存池中的内存来源类型定义在 `/include/linux/slab.h` 文件中：
+
+```c
+enum kmalloc_cache_type {
+    // 规定 kmalloc 内存池的内存需要在 ZONE_NORMAL 直接映射区分配
+    KMALLOC_NORMAL = 0,
+    /* 规定 kmalloc 内存池中的内存是可以回收的，RECLAIM 类型的内存页，不能移动，但是可以直接回收，比如文件缓存页，它们就可以直接被回收掉，
+     * 当再次需要的时候可以从磁盘中读取生成。或者一些生命周期比较短的内存页，比如 DMA 缓存区中的内存页也是可以被直接回收掉。
+     */
+    KMALLOC_RECLAIM,
+#ifdef CONFIG_ZONE_DMA
+    // kmalloc 内存池中的内存用于 DMA，需要在 ZONE_DMA 区域分配
+    KMALLOC_DMA,
+#endif
+    NR_KMALLOC_TYPES
+};
+```
+
+![memory](./images/memory249.png)
+
+上图中所展示的 kmalloc 内存池整体架构体系，内核将其定义在一个 `kmalloc_caches` 二维数组中，位于文件：`/include/linux/slab.h` 中。
+
+```c
+struct kmem_cache *
+kmalloc_caches[NR_KMALLOC_TYPES][KMALLOC_SHIFT_HIGH + 1]；
+```
+
+- 第一维数组用于表示 kmalloc 内存池中的内存来源于哪些物理内存区域中，即 `enum kmalloc_cache_type`。
+- 第二维数组中的元素一共 KMALLOC_SHIFT_HIGH 个，用于存储每种内存块尺寸对应的 slab cache。在 slub 实现中，kmalloc 内存池中的内存块尺寸在 8字节到 8K 之间，其中还包括了两个特殊的尺寸分别为 96 字节 和 192 字节。第二维数组中的 index 表示的含义和 kmalloc_info[] 数组中的 index 含义一模一样，均是表示对应 slab cache 中内存块尺寸的分配阶（2 的次幂）。96 和 192 这两个内存块尺寸除外，它们的 index 分别是 1 和 2，单独特殊指定。
+
+#### kmalloc 内存池的创建
+
+```c
+void __init kmem_cache_init(void)
+{
+	......
+    /* Now we can use the kmem_cache to allocate kmalloc slabs */
+    // 初始化 size_index 数组
+    setup_kmalloc_cache_index_table();
+    // 创建 kmalloc_info 数组中保存的各个内存块大小对应的 slab cache，最终将这些不同尺寸的 slab cache 缓存在 kmalloc_caches 中
+    create_kmalloc_caches(0);
+}
+
+#define PAGE_SHIFT          12
+#define KMALLOC_SHIFT_HIGH  (PAGE_SHIFT + 1)
+#define KMALLOC_SHIFT_LOW   3
+
+void __init create_kmalloc_caches(slab_flags_t flags)
+{
+    int i, type;
+    /* 初始化二维数组 kmalloc_caches，
+     * 为每一个 kmalloc_cache_type 类型创建内存块尺寸从 KMALLOC_SHIFT_LOW 到 KMALLOC_SHIFT_HIGH 大小的 kmalloc 内存池
+     */
+    for (type = KMALLOC_NORMAL; type <= KMALLOC_RECLAIM; type++) {
+        // 这里会从 8B 尺寸的内存池开始创建，一直到创建完 8K 尺寸的内存池
+        for (i = KMALLOC_SHIFT_LOW; i <= KMALLOC_SHIFT_HIGH; i++) {
+            if (!kmalloc_caches[type][i])
+                // 创建对应尺寸的 kmalloc 内存池，其中内存块大小为 2^i 字节
+                new_kmalloc_cache(i, type, flags);
+
+            /* 创建 kmalloc-96 内存池管理 96B 尺寸的内存块
+             * 专门特意创建一个 96 字节尺寸的内存池的目的是为了，应对 64B 到 128B 之间的内存分配需求，要不然超过 64B 就分配一个 128B 的内存块有点浪费
+             */
+            if (KMALLOC_MIN_SIZE <= 32 && i == 6 &&
+                    !kmalloc_caches[type][1])
+                new_kmalloc_cache(1, type, flags);
+            /* 创建 kmalloc-192 内存池管理 192B 尺寸的内存块
+             * 这里专门创建一个 192 字节尺寸的内存池，是为了分配 128B 到 192B 之间的内存分配需求
+             * 要不然超过 128B 直接分配一个 256B 的内存块太浪费了
+             */
+            if (KMALLOC_MIN_SIZE <= 64 && i == 7 &&
+                    !kmalloc_caches[type][2])
+                new_kmalloc_cache(2, type, flags);
+        }
+    }
+
+    // 当 kmalloc 体系全部创建完毕之后，slab 体系的状态就变为 up 状态了
+    slab_state = UP;
+
+#ifdef CONFIG_ZONE_DMA
+    // 如果配置了 DMA 内存区域，则需要为该区域也创建对应尺寸的内存池
+    for (i = 0; i <= KMALLOC_SHIFT_HIGH; i++) {
+        struct kmem_cache *s = kmalloc_caches[KMALLOC_NORMAL][i];
+
+        if (s) {
+            unsigned int size = kmalloc_size(i);
+            const char *n = kmalloc_cache_name("dma-kmalloc", size);
+
+            BUG_ON(!n);
+            kmalloc_caches[KMALLOC_DMA][i] = create_kmalloc_cache(
+                n, size, SLAB_CACHE_DMA | flags, 0, 0);
+        }
+    }
+#endif
+}
+```
+
+在第一个 for 循环体内的二重循环里，当 `i = 6` 时，表示现在准备要创建 `2^6 = 64` 字节尺寸的 slab cache —— kmalloc-64，当创建完 kmalloc-64 时，需要紧接着特殊创建 kmalloc-96，而 kmalloc-96 在 kmalloc_info 数组和 kmalloc_caches 二维数组中的索引均是 1，所以调用 new_kmalloc_cache 创建具体尺寸的 slab cache 时候，第一个参数指的是 slab cache 在 kmalloc_caches 数组中的 index，这里传入的是 1。同样的道理，在 当 `i = 7` 时，表示现在准备要创建 `2^7 = 128` 字节尺寸的 slab cache —— kmalloc-128，然后紧接着就需要特殊创建 kmalloc-192，而 kmalloc-192 在 kmalloc_caches 二维数组中的索引是 2，所以 new_kmalloc_cache 第一个参数传入的是 2。
+
+```c
+static void __init
+new_kmalloc_cache(int idx, int type, slab_flags_t flags)
+{
+    // 参数 idx，即为 kmalloc_info 数组中的下标，根据 kmalloc_info 数组中的信息创建对应的 kmalloc 内存池
+    const char *name;
+    // 为 slab cache 创建名称
+    if (type == KMALLOC_RECLAIM) {
+        flags |= SLAB_RECLAIM_ACCOUNT;
+        // kmalloc_cache_name 就是做简单的字符串拼接
+        name = kmalloc_cache_name("kmalloc-rcl",
+                        kmalloc_info[idx].size);
+        BUG_ON(!name);
+    } else {
+        name = kmalloc_info[idx].name;
+    }
+    
+    // 底层调用 __kmem_cache_create 创建 kmalloc_info[idx].size 尺寸的 slab cache
+    kmalloc_caches[type][idx] = create_kmalloc_cache(name,
+                    kmalloc_info[idx].size, flags, 0,
+                    kmalloc_info[idx].size);
+}
+```
+
+#### kmalloc 内存的分配与回收
+
+![memory](./images/memory250.png)
+
+```c
+static __always_inline void *kmalloc(size_t size, gfp_t flags)
+{
+    return __kmalloc(size, flags);
+}
+
+#define KMALLOC_MAX_CACHE_SIZE	(1UL << KMALLOC_SHIFT_HIGH)
+#define PAGE_SHIFT      12
+#define KMALLOC_SHIFT_HIGH  (PAGE_SHIFT + 1)
+
+void *__kmalloc(size_t size, gfp_t flags)
+{
+    struct kmem_cache *s;
+    void *ret;
+    /* KMALLOC_MAX_CACHE_SIZE 规定 kmalloc 内存池所能管理的内存块最大尺寸，在 slub 实现中是 2页 大小，即 8k
+     * 如果使用 kmalloc 申请超过 2页 大小的内存，则直接走伙伴系统
+     */
+    if (unlikely(size > KMALLOC_MAX_CACHE_SIZE))
+        // 底层调用 alloc_pages 向伙伴系统申请超过 2页 的内存块
+        return kmalloc_large(size, flags);
+    // 根据申请内存块的尺寸 size，在 kmalloc_caches 缓存中选择合适尺寸的内存池
+    s = kmalloc_slab(size, flags);
+    // 向选取的 slab cache 申请内存块
+    ret = slab_alloc(s, flags, _RET_IP_);
+    return ret;
+}
+
+struct kmem_cache *kmalloc_slab(size_t size, gfp_t flags)
+{
+    unsigned int index;
+    /* 如果申请的内存块 size 在 192 字节以下，则通过 size_index 数组定位 kmalloc_caches 缓存索引
+     * 从而获取到最佳合适尺寸的内存池 slab cache
+     */
+    if (size <= 192) {
+        if (!size)
+            return ZERO_SIZE_PTR;
+        // 根据申请的内存块 size，定义 size_index 数组索引，从而获取 kmalloc_caches 缓存的 index
+        index = size_index[size_index_elem(size)];
+    } else {
+         /* 如果申请的内存块 size 超过 192 字节，则通过 fls 定位 kmalloc_caches 缓存的 index
+          * fls 可以获取参数的最高有效 bit 的位数，比如 fls(0)=0，fls(1)=1，fls(4) = 3
+          */
+        index = fls(size - 1);
+    }
+    // 根据 kmalloc_type 以及 index 获取最佳尺寸的内存池 slab cache
+    return kmalloc_caches[kmalloc_type(flags)][index];
+}
+
+static inline unsigned int size_index_elem(unsigned int bytes)
+{
+    // sizeindex
+    return (bytes - 1) / 8;
+}
+```
+
+![memory](./images/memory251.png)
+
+![memory](./images/memory252.png)
+
+```c
+static __always_inline enum kmalloc_cache_type kmalloc_type(gfp_t flags)
+{
+#ifdef CONFIG_ZONE_DMA
+
+    // 通常情况下 kmalloc 内存池中的内存都来源于 NORMAL 直接映射区，如果没有特殊设定，则从 NORMAL 直接映射区里分配
+    if (likely((flags & (__GFP_DMA | __GFP_RECLAIMABLE)) == 0))
+        return KMALLOC_NORMAL;
+
+    // DMA 区域中的内存是非常宝贵的，如果明确指定需要从 DMA 区域中分配内存，则选取 DMA 区域中的 kmalloc 内存池
+    return flags & __GFP_DMA ? KMALLOC_DMA : KMALLOC_RECLAIM;
+#else
+    // 明确指定了从 RECLAIMABLE 区域中获取内存，则选取 RECLAIMABLE 区域中 kmalloc 内存池，该区域中的内存页是可以被回收的，比如：文件页缓存
+    return flags & __GFP_RECLAIMABLE ? KMALLOC_RECLAIM : KMALLOC_NORMAL;
+#endif
+}
+
+void kfree(const void *x)
+{
+    struct page *page;
+    // x 为要释放的内存块的虚拟内存地址
+    void *object = (void *)x;
+    // 通过虚拟内存地址找到内存块所在的 page
+    page = virt_to_head_page(x);
+    // 如果 page 不在 slab cache 的管理体系中，则直接释放回伙伴系统
+    if (unlikely(!PageSlab(page))) {
+        __free_pages(page, order);
+        return;
+    }
+    // 将内存块释放回其所在的 slub 中
+    slab_free(page->slab_cache, page, object, NULL, 1, _RET_IP_);
 }
 ```
 
@@ -8360,3 +10503,308 @@ struct task_struct {
 可以在 ps 命令上增加 -o 选项，添加 `maj_flt` ，`min_flt` 数据列来查看各个进程的 `VM_FAULT_MAJOR` 次数和 `VM_FAULT_MINOR` 次数。
 
 ![memory](./images/memory165.png)
+
+
+
+### KASAN
+
+Kernel Address SANitizer（KASAN）是一个动态检测内存错误的工具。它为找到 use-after-free 和 out-of-bounds 问题提供了一个快速和全面的解决方案。KASAN 使用编译时检测每个内存访问，因此需要 GCC 4.9.2 或更高版本。检测堆栈或全局变量的越界访问需要 GCC 5.0 或更高版本。目前 KASAN 仅支持 x86_64 和 arm64 架构（linux 4.4版本合入）。
+
+使用 KASAN 工具是比较简单的，只需要添加 Kernel 以下配置项。
+
+```c
+CONFIG_SLUB_DEBUG=y
+CONFIG_KASAN=y
+```
+
+
+为什么这里必须打开 SLUB_DEBUG 呢？是因为有段时间 KASAN 是依赖 SLUBU_DEBUG 的，在 Kconfig 中使用了 depends on。不过最新的代码已经不需要依赖了。但是还是建议打开该选项，因为 log 可以输出更多有用的信息。重新编译 Kernel 即可，编译之后会发现boot.img（Android环境）大小大了一倍左右。所以说，影响效率不是没有道理的。不过可以作为产品发布前的最后检查，也可以排查越界访问等问题。可以查看内核日志内容是否包含 KASAN 检查出的 bug 信息。
+
+#### 实现原理
+
+KASAN 的原理是利用额外的内存标记可用内存的状态。这部分额外的内存被称作 shadow memory（影子区）。KASAN 将 1/8 的内存用作 shadow memory。使用特殊的 magic num 填充 shadow memory，在每一次 load/store（load/store 检查指令由编译器插入）内存的时候检测对应的 shadow memory 确定操作是否 valid。连续 8 bytes 内存（8 bytes align）使用 1 byte shadow memory 标记。如果 8 bytes 内存都可以访问，则 shadow memory 的值为 0；如果连续 N(1 =< N <= 7) bytes 可以访问，则 shadow memory 的值为 N；如果 8 bytes 内存访问都是 invalid，则 shadow memory 的值为负数。
+
+![memory](./images/memory253.png)
+
+在代码运行时，每一次 memory access 都会检测对应的 shawdow memory 的值是否 valid。这就需要编译器做些工作。编译的时候，在每一次 memory access 前编译器会插入 `__asan_load##size()` 或者 `__asan_store##size()` 函数调用（size 是访问内存字节的数量）。这也是要求更新版本 gcc 的原因，只有更新的版本才支持自动插入。
+
+```assembly
+mov x0, #0x5678
+movk x0, #0x1234, lsl #16
+movk x0, #0x8000, lsl #32
+movk x0, #0xffff, lsl #48
+mov w1, #0x5
+bl __asan_store1
+strb w1, [x0]
+```
+
+上面一段汇编指令是往 0xffff800012345678 地址写 5。在 KASAN 打开的情况下，编译器会自动插入 `bl __asan_store1` 指令，`__asan_store1` 函数就是检测一个地址对应的 shadow memory 的值是否允许写 1 byte。strb 就是真正的内存访问。因此 KASAN 可以在 out-of-bounds 的时候及时检测。`__asan_load##size()` 和 `__asan_store##size()` 的代码在 mm/kasan/kasan.c 文件实现。
+
+##### 根据 shadow memory 的值判断内存访问操作是否合法
+
+shadow memory 检测原理的实现主要就是 `__asan_load##size()` 和 `__asan_store##size()` 函数的实现。那么 KASAN 是如何根据访问的 address 以及对应的 shadow memory 的状态值来判断访问是否合法呢？首先看一种最简单的情况。访问 8 bytes 内存。
+
+```c
+long *addr = (long *)0xffff800012345678;
+*addr = 0;
+```
+
+检测原理如下：
+
+```c
+long *addr = (long *)0xffff800012345678;
+
+char *shadow = (char *)(((unsigned long)addr >> 3) + KASAN_SHADOW_OFFSET);
+if (*shadow)
+    report_bug();
+
+*addr = 0;
+```
+
+中间的代码就是编译器插入的指令。既然是访问 8 bytes，必须要保证对应的 shadow mempry 的值必须是0，否则肯定是有问题。那么如果访问的是 1,2 or 4 bytes 该如何检查呢？也很简单，只需要修改一下 if 判断条件即可。修改如下：
+
+```c
+if (*shadow && *shadow < ((unsigned long)addr & 7) + N); // N = 1,2,4
+```
+
+如果 *shadow 的值为 0 代表 8 bytes 均可以访问，自然就不需要 report bug。addr & 7 是计算访问地址相对于 8 字节对齐地址的偏移。还是使用下图来说明关系吧。假设内存是从地址 8~15 一共 8 bytes。对应的 shadow memory 值为 5，现在访问 11 地址。那么这里的 N 只要大于 2 就是 invalid。
+
+![memory](./images/memory254.png)
+
+##### shadow memory 内存分配
+
+在 ARM64 中，假设 VA_BITS 配置成 48。那么 kernel space 空间大小是 256TB，因此 shadow memory 的内存需要 32TB。在虚拟地址空间为 KASAN shadow memory 分配地址空间。所以有必要了解一下 	ARM64 memory layout。
+
+基于 Linux-4.15.0-rc3 的代码分析，绘制如下 memory layout（VA_BITS = 48）。kernel space 起始虚拟地址是 0xffff_0000_0000_0000，kernel space 被分成几个部分，分别是 KASAN、MODULE、VMALLOC、FIXMAP、PCI_IO、VMEMMAP 以及 linear mapping。其中 KASAN 的大小是 32TB，正好是 kernel space 大小的 1/8。KERNEL 的位置相对以前有所不一样。KERNEL 位于linear mapping 区域，这里怎么变成了 VMALLOC 区域 ？这里是 Ard Biesheuvel 提交的修改。主要是为了迎接 ARM64 世界的 KASLR（which allows the kernel image to be located anywhere in the vmalloc area）的到来。
+
+![memory](./images/memory255.png)
+
+##### 建立 shadow memory 的映射关系
+
+当打开 KASAN 的时候，KASAN 区域位于 kernel space 首地址处，从 0xffff_0000_0000_0000 地址开始，大小是 32TB。shadow memory 和 kernel address 转换关系是：`shadow_addr = (kaddr >> 3) + KASAN_SHADOW_OFFSE`。为了将 [0xffff_0000_0000_0000, 0xffff_ffff_ffff_ffff] 和 [0xffff_0000_0000_0000, 0xffff_1fff_ffff_ffff] 对应起来，因此计算 KASAN_SHADOW_OFFSE 的值为 0xdfff_2000_0000_0000。将KASAN区域放大，如下图所示。
+
+![memory](./images/memory256.png)
+
+KASAN 区域仅仅是分配的虚拟地址，在访问的时候必须建立和物理地址的映射才可以访问。上图就是 KASAN 建立的映射布局。左边是系统启动初期建立的映射。在 `kasan_early_init()` 函数中，将所有的 KASAN 区域映射到 `kasan_zero_page` 物理页面。因此系统启动初期，KASAN 并不能工作。右侧是在 `kasan_init()` 函数中建立的映射关系，`kasan_init()` 函数执行结束就预示着 KASAN 的正常工作。不需要 address sanitizer 功能的区域同样还是映射到 `kasan_zero_page` 物理页面，并且是 readonly。主要是检测 kernel 和物理内存是否存在 UAF 或者 OOB 问题。所以建立 KERNEL 和 linear mapping（仅仅是所有的物理地址建立的映射区域）区域对应的 shadow memory 建立真实的映射关系。MOUDLE 区域对应的 shadow memory 的映射关系也是需要创建的，但是映射关系建立是动态的，在 module 加载的时候才会去创建映射关系。
+
+##### 伙伴系统分配的内存的 shadow memory 值如何填充
+
+既然 shadow memory 已经建立映射，接下来的事情就是探究各种内存分配器向 shadow memory 填充什么数据了。首先看一下伙伴系统 allocate page(s) 函数填充 shadow memory 情况。
+
+![memory](./images/memory257.png)
+
+假设从 buddy system 分配 4 pages。系统首先从 order=2 的链表中摘下一块内存，然后根据 shadow memory address 和 memory address 之间的对应的关系找对应的 shadow memory。这里 shadow memory 的大小将会是 2KB，系统会全部填充 0 代表内存可以访问。对分配的内存的任意地址内存进行访问的时候，首先都会找到对应的 shadow memory，然后根据 shadow memory value 判断访问内存操作是否 valid。
+
+![memory](./images/memory258.png)
+
+同样的，当释放 pages 的时候，会填充 shadow memory 的值为 0xFF。如果释放之后，依然访问内存的话，此时 KASAN 根据 shadow memory 的值是 0xFF 就可以断，这是一个 use-after-free 问题。
+
+##### SLUB 分配对象的内存的 shadow memory 值如何填充
+
+打开 KASAN 的时候，SLUB Allocator 管理的 object layout 将会放生一定的变化。如下图所示。
+
+![memory](./images/memory259.png)
+
+在打开 SLUB_DEBUG 的时候，object 就增加很多内存，KASAN 打开之后，在此基础上又加了一截。第一次创建 slab 缓存池的时候，系统会调用 `kasan_poison_slab()` 函数初始化 shadow memory 为下图的模样。整个 slab 对应的 shadow memory 都填充 0xFC。
+
+![memory](./images/memory260.png)
+
+上述步骤虽然填充了 0xFC，但是接下来初始化 object 的时候，会改变一些 shadow memory 的值。先看一下 `kmalloc(20)` 的情况。`kmalloc()` 就是基于 SLUB Allocator 实现的，所以会从 kmalloc-32 的 kmem_cache 中分配一个 32 bytes object。
+
+![memory](./images/memory261.png)
+
+首先调用 `kmalloc(20)` 函数会匹配到 kmalloc-32 的 kmem_cache，因此实际分配的 object 大小是 32 bytes。KASAN 同样会标记剩下的 12 bytes 的 shadow memory 为不可访问状态。根据 object 的地址，计算 shadow memory 的地址，并开始填充数值。由于 `kmalloc()` 返回的 object 的 size 是 32 bytes，而 `kmalloc(20)` 只申请了 20 bytes，剩下的 12 bytes 不能使用。KASAN 必须标记 shadow memory 这种情况。object 对应的 4 bytes shadow memory 分别填充 00 00 04 FC。00 代表 8 个连续的字节可以访问。04 代表前 4 个字节可以访问。作为越界访问的检测的方法。总共加在一起是正好是 20 bytes 可访问。0xFC 是 redzone 标记。如果访问了 redzone 区域 KASAN 就会检测 out-of-bounds 的发生。
+
+![memory](./images/memory262.png)
+
+`kfree()` 释放时，根据 object 首地址找到对应的 shadow memory，32 bytes object 对应 4 bytes 的 shadow memory，现在填充 0xFB 标记内存是释放的状态。此时如果继续访问 object，那么根据 shadow memory 的状态值既可以确定是 use-after-free 问题。
+
+##### 全局变量的 shadow memory 值如何填充
+
+前面的分析都是基于内存分配器的，redzone 都会随着内存分配器一起分配。那么 global variables 如何检测呢？global variable 的 redzone 在哪里呢？这就需要编译器下手了。编译器会填充 redzone 区域。例如定义一个全局变量 a，编译器会填充成下面的样子：
+
+```c
+struct {
+    char original[4];
+    char redzone[60];
+} a; // 32 bytes aligned
+```
+
+这是验证结果，填充 60 bytes 原因可能编译器相关。可能的原理是这样的。全局变量实际占用内存总数 S（以 byte 为单位）按照每块 32 bytes 平均分成 N 块。假设最后一块内存距离目标 32 bytes 还差 y bytes（if S % 32 == 0，y = 0），那么 redzone 填充的大小就是 (y + 32) bytes。画图示意如下（S % 32 != 0）。因此总结的规律是：redzone = 63 – (S - 1) % 32。
+
+![memory](./images/memory263.png)
+
+编译器会为每一个全局变量创建一个函数，函数名称是：`_GLOBAL__sub_I_65535_1_##global_variable_name`。这个函数中通过调用 `__asan_register_globals()` 函数完成 shadow memory 标记。并且将自动生成的这个函数的首地址放在 .init_array 段。在 Kernel 启动阶段，通过以下代调用关系最终调用所有全局变量的构造函数。`kernel_init_freeable()->do_basic_setup()->do_ctors()`。`do_ctors()` 代码实现如下：
+
+```c
+static void __init do_ctors(void)
+{
+    ctor_fn_t *fn = (ctor_fn_t *) __ctors_start;
+    for (; fn < (ctor_fn_t *) __ctors_end; fn++)
+        (*fn)();
+}
+```
+
+遍历 `__ctors_start` 和 `__ctors_end` 之间的所有数据，作为函数地址进行调用，即完成了所有的 global variables 的 shadow memory 初始化。可以从链接脚本中知道 `__ctors_start` 和 `__ctors_end` 的意思。
+
+```c
+#define KERNEL_CTORS()  . = ALIGN(8);              \
+            VMLINUX_SYMBOL(__ctors_start) = .; \
+            KEEP(*(.ctors))            \
+            KEEP(*(SORT(.init_array.*)))       \
+            KEEP(*(.init_array))           \
+            VMLINUX_SYMBOL(__ctors_end) = .;
+```
+
+以一个具体的实例说明，定义 3 个全局变量如下：
+
+```c
+12 volatile char smc_num1[4];
+13 volatile char smc_num2[31];
+14 volatile char smc_num3[7];
+```
+
+编译 Kernel，看看 System.map 文件中，3 个全局变量分配的地址。
+
+```c
+ffff200009f540e0 B smc_num1
+ffff200009f54120 B smc_num2
+ffff200009f54160 B smc_num3
+```
+
+反汇编 vmlinux 看下 `_GLOBAL__sub_I_65535_1_smc_num1` 函数的实现
+
+```assembly
+ffff200009381df0 <_GLOBAL__sub_I_65535_1_smc_num1>:
+ffff200009381df0:   a9bf7bfd    stp x29, x30, [sp,#-16]!
+ffff200009381df4:   b0001800    adrp    x0, ffff200009682000
+ffff200009381df8:   91308000    add x0, x0, #0xc20
+ffff200009381dfc:   d2800061    mov x1, #0x3                    // #3
+ffff200009381e00:   910003fd    mov x29, sp
+ffff200009381e04:   9100c000    add x0, x0, #0x30
+ffff200009381e08:   97c09fb8    bl  ffff2000083a9ce8 <__asan_register_globals>
+ffff200009381e0c:   a8c17bfd    ldp x29, x30, [sp],#16
+ffff200009381e10:   d65f03c0    ret
+```
+
+通过上面的汇编计算一下，x0=0xffff200009682c50，x1=3。然后调用 `__asan_register_globals() `函数，x0 和 x1 就是传递的参数。看一下 `__asan_register_globals()` 函数实现。
+
+```c
+void __asan_register_globals(struct kasan_global *globals, size_t size)
+{
+    int i;
+    for (i = 0; i < size; i++)
+        register_global(&globals[i]);
+}
+```
+
+size 是 3 就是要初始化全局变量的个数，所以这里只需要一个构造函数即可。一次性将 3 个全局变量全部搞定。可能是以文件为单位编译器创建一个构造函数即可，将本文件全局变量一次性全部打包初始化。第一个参数 globals 是 0xffff200009682c50，继续从 vmlinux.txt中查看该地址处的数据。`struct kasan_global` 是编译器自动创建的结构体，每一个全局变量对应一个 `struct kasan_global` 结构体。`struct kasan_global` 结构体存放的位置是 .data 段，因此可以从 .data 段查找当前地址对应的数据。数据如下：
+
+```c
+ffff200009682c50 6041f509 0020ffff 07000000 00000000
+ffff200009682c60 40000000 00000000 d0d62b09 0020ffff
+ffff200009682c70 b8d62b09 0020ffff 00000000 00000000
+ffff200009682c80 202c6809 0020ffff 2041f509 0020ffff
+ffff200009682c90 1f000000 00000000 40000000 00000000
+ffff200009682ca0 e0d62b09 0020ffff b8d62b09 0020ffff
+ffff200009682cb0 00000000 00000000 302c6809 0020ffff
+ffff200009682cc0 e040f509 0020ffff 04000000 00000000
+ffff200009682cd0 40000000 00000000 f0d62b09 0020ffff
+ffff200009682ce0 b8d62b09 0020ffff 00000000 00000000
+```
+
+首先 ffff200009682c50 对应的第一个数据 6041f509 0020ffff，这个是个地址数据，得反过来看。这个地址其实是 ffff200009f54160，正是 smc_num3 的地址。解析这段数据之前需要了解一下 `struct kasan_global` 结构体。
+
+```c
+/* The layout of struct dictated by compiler */
+struct kasan_global {
+    const void *beg;        /* Address of the beginning of the global variable. */
+    size_t size;            /* Size of the global variable. */
+    size_t size_with_redzone;   /* Size of the variable + size of the red zone. 32 bytes aligned */
+    const void *name;
+    const void *module_name;    /* Name of the module where the global variable is declared. */
+    unsigned long has_dynamic_init; /* This needed for C++ */
+#if KASAN_ABI_VERSION >= 4
+    struct kasan_source_location *location;
+#endif
+};
+```
+
+第一个成员 beg 就是全局变量的首地址。跟上面的分析一致。第二个成员 size 从上面数据看出是7，正好对应定义的 smc_num3[7]，正好 7 bytes。size_with_redzone 的值是 0x40，正好是 64。根据上面猜测 redzone = 63 - (7 - 1) % 32 = 57。加上 size 正好是 64。name 成员对应的地址是 ffff2000092bd6d0。看下 ffff2000092bd6d0 存储的是什么。
+
+```c
+ffff2000092bd6d0 736d635f 6e756d33 00000000 00000000  smc_num3........
+```
+
+所以 name 就是全局变量的名称转换成字符串。同样的方式得到 module_name 的地址是 ffff2000092bd6b8。继续看看这段地址存储的数据。
+
+```c
+ffff2000092bd6b0 65000000 00000000 64726976 6572732f  e.......drivers/
+ffff2000092bd6c0 696e7075 742f736d 632e6300 00000000  input/smc.c.....
+```
+
+module_name 是文件的路径。has_dynamic_init 的值就是 0，这是 C++ 需要的。实验用的 GCC 版本是 5.0 左右，所以这里的 KASAN_ABI_VERSION=4。这里 location 成员的地址是 ffff200009682c20，继续追踪该地址的数据。
+
+```c
+ffff200009682c20 b8d62b09 0020ffff 0e000000 0f000000
+```
+
+解析这段数据之前要先了解 `struct kasan_source_location` 结构体。
+
+```c
+/* The layout of struct dictated by compiler */
+struct kasan_source_location {
+    const char *filename;
+    int line_no;
+    int column_no;
+};
+```
+
+第一个成员 filename 地址是 ffff2000092bd6b8 和 module_name 一样的数据。剩下两个数据分别是 14 和 15，分别代表全局变量定义地方的行号和列号，和定义里一致。剩下的 `struct kasan_global` 数据就是 smc_num1 和 smc_num2 的数据同理。`_GLOBAL__sub_I_65535_1_smc_num1 `函数会被自动调用，该地址数据填充在 `__ctors_start` 和 `__ctors_end` 之间。现在也证明一下观点。先从 System.map 得到符号的地址数据。
+
+```c
+ffff2000093ac5d8 T __ctors_start
+ffff2000093ae860 T __ctors_end
+```
+
+然后搜索一下 `_GLOBAL__sub_I_65535_1_smc_num1` 的地址 ffff200009381df0 被存储在什么位置。
+
+```c
+ffff2000093ae0c0 f01d3809 0020ffff 181e3809 0020ffff
+```
+
+可以看出 ffff2000093ae0c0 地址处存储着 `_GLOBAL__sub_I_65535_1_smc_num1` 函数地址。这个地址不是正好位于 `__ctors_start` 和 `__ctors_end` 之间。
+
+![memory](./images/memory264.png)
+
+以 char a[4] 为例，a[4] 只有 4 bytes 可以访问，所以对应的 shadow memory 的第一个 byte 值是 4，后面的 redzone 就填充 0xFA 作为越界检测。因为这里是全局变量，因此分配的内存区域位于 Kernel 区域。
+
+##### 栈分配变量的 readzone 是如何分配的
+
+从栈中分配的变量同样和全局变量一样需要填充一些内存作为 redzone 区域。下面继续举个例子说明编译器怎么填充。首先来一段正常的代码，没有编译器的插手。
+
+```c
+void foo()
+{
+    char a[328];
+}
+```
+
+再来看看编译器插了哪些东西进去
+
+```c
+void foo()
+{
+    char rz1[32];
+    char a[328];
+    char rz2[56];
+    int *shadow = （&rz1 >> 3）+ KASAN_SHADOW_OFFSE;
+    shadow[0] = 0xffffffff;
+    shadow[11] = 0xffffff00;
+    shadow[12] = 0xffffffff;
+
+    shadow[0] = shadow[11] = shadow[12] = 0;
+}
+```
+
+rz2 是编译器填充内存，大小是56，可以根据上一节全局变量的公式套用计算得到。但是这里在变量前面还有 32 bytes 的 rz1。这个是和全局变量的不同，可能为了检测栈变量左边界越界问题。后面的代码也是编译器填充，初始化 shadow memory。
