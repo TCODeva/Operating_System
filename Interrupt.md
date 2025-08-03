@@ -6,7 +6,7 @@
 
 硬件中断系统主要有三种器件参与，各个外设、中断控制器和 CPU。各个外设提供 irq request line，在发生中断事件的时候，通过 irq request line 上的电气信号向 CPU 系统请求处理。外设的 irq request line 太多，CPU 需要一个小伙伴帮他，这就是 interrupt controller。interrupt controller 是连接外设中断系统和 CPU 系统的桥梁。根据外设 irq request line 的多少，interrupt controller 可以级联。CPU 的主要功能是运算，因此 CPU 并不处理中断优先级，那是 interrupt controller 的事情。对于 CPU 而言，一般有两种中断请求，例如：对于 ARM，是 IRQ 和 FIQ 信号线，分别让 ARM 进入 IRQ mode 和 FIQ mode。对于X86，有可屏蔽中断和不可屏蔽中断。而 CPU HW block 是指 ARM core 或者 X86 这样的实际硬件 block 的一个逻辑描述，实际中，可能是任何可能的 CPU block。HW 中断系统之逻辑 block diagram 如下图所示：
 
-![memory](./images/irq.gif)
+![interrupt](./images/irq.gif)
 
 系统中有若干个 CPU block 用来接收中断事件并进行处理，若干个 interrupt controller 形成树状的结构，汇集系统中所有外设的 irq request line，并将中断事件分发给某一个 CPU block 进行处理。从接口层面看，主要有两类接口，一种是中断接口。有的实现中，具体中断接口的形态就是一个硬件的信号线，通过电平信号传递中断事件（ARM 以及 GIC 组成的中断系统就是这么设计的）。有些系统采用了其他的方法来传递中断事件，比如 x86＋APIC（Advanced Programmable interrupt controller）组成的系统，每个 x86 的核有一个 Local APIC，这些 Local APIC 们通过 ICC（interrupt controller Communication）bus 连接到 IO APIC 上。IO APIC 收集各个外设的中断，并翻译成总线上的 message，传递给某个 CPU 上的 Local APIC。因此，上面的红色线条也是逻辑层面的中断信号，可能是实际的 PCB 上的铜线（或者 SOC 内部的铜线），也可能是一个 message 而已。除了中断接口，CPU 和 interrupt controller 之间还需要有控制信息的交流。interrupt controller 会开放一些寄存器让 CPU 访问、控制。
 
@@ -42,7 +42,7 @@ interrupt controller 有的是支持多个 CPU core 的（例如 GIC、APIC 等�
 
 Linux Kernel 的中断子系统相关的软件框架图如下所示：
 
-![memory](./images/irq2.gif)
+![interrupt](./images/irq2.gif)
 
 由上面的block图，可知 Linux Kernel 的中断子系统分成4个部分：
 
@@ -599,7 +599,7 @@ static void irq_domain_set_mapping(struct irq_domain *domain,
 
 #### 基本概念
 
-![memory](./images/irq3.gif)
+![interrupt](./images/irq3.gif)
 
 在 Linux Kernel 中，对于每一个外设的 irq 都用 `struct irq_desc` 来描述，称之中断描述符。Linux Kernel 中会有一个数据结构保存了关于所有 irq 的中断描述符信息（上图中红色框图内）。当发生中断后，首先获取触发中断的 HW interupt ID，然后通过 irq domain 翻译成 irq number，然后通过 irq number 就可以获取对应的中断描述符。调用中断描述符中的 highlevel irq-events handler 来进行中断处理就可以了。而 highlevel irq-events handler 主要进行下面两个操作：
 
@@ -1380,7 +1380,7 @@ out:
 
 使用 `handle_edge_irq` 这个 handler 的硬件中断系统行为如下：
 
-![memory](./images/irq4.gif)
+![interrupt](./images/irq4.gif)
 
 以上升沿为例描述边缘中断的处理过程（下降沿的触发是类似的）。当 interrupt controller 检测到了上升沿信号，会将该上升沿状态（pending）锁存在寄存器中，并通过中断的 signal 向 CPU 触发中断。需要注意：这时候外设和 interrupt controller 之间的 interrupt request 信号线会保持高电平，这也就意味着 interrupt controller 不可能检测到新的中断信号（本身是高电平，无法形成上升沿）。这个高电平信号会一直保持到软件 ack 该中断（调用 irq chip 的 irq_ack callback 函数）。ack 之后，中断控制器才有可能继续探测上升沿，触发下一次中断。
 
@@ -1482,7 +1482,7 @@ irqreturn_t handle_irq_event(struct irq_desc *desc)
 
 使用 `handle_level_irq` 这个 handler 的硬件中断系统行为如下：
 
-![memory](./images/irq5.gif)
+![interrupt](./images/irq5.gif)
 
 以高电平触发为例。当 interrupt controller 检测到了高电平信号，并通过中断的 signal 向 CPU 触发中断。这时候，对中断控制器进行 ack 并不能改变 interrupt request signal 上的电平状态，一直要等到执行具体的中断服务程序（specific handler），对外设进行 ack 的时候，电平信号才会恢复成低电平。在对外设 ack 之前，中断状态一直是 pending 的，如果没有 mask 中断，那么中断控制器就会 assert CPU。
 
@@ -1549,7 +1549,7 @@ out_unlock:
 
 Linux 2.4 之前的内核是不支持抢占特性的，具体可以参考下图：
 
-![memory](./images/irq6.gif)
+![interrupt](./images/irq6.gif)
 
 - 事情的开始源自高优先级任务（橙色 block）由于要等待外部事件（例如网络数据）而进入睡眠，调度器调度了某个低优先级的任务（紫色 block）执行。该低优先级任务一直执行，直到触发了一次系统调用（例如通过 read() 文件接口读取磁盘上的文件等）而进入了内核态。低优先级任务正在执行不会变化，只不过从 user space 切换到了 kernel space。T0 时刻，高优先级任务等待的那个中断事件发生了。
 - 中断虽然发生了，但软件不一定立刻响应，可能由于在内核态执行的某些操作不希望被外部事件打断而主动关闭了中断（或是关闭了 CPU 的中断，或者 MASK 了该 irq number），这时候，中断信号没有立刻得到响应，软件仍然在内核态执行低优先级任务系统调用的代码。在 T1 时刻，内核态代码由于退出临界区而打开中断（注意：上图中的比例是不协调的，一般而言，Linux kernel不会有那么长的关中断时间，上面主要是为了表示清楚，同理，从中断触发到具体中断服务程序的执行也没有那么长，都是为了表述清楚），中断一旦打开，立刻跳转到了异常向量地址，interrupt handler 抢占了低优先级任务的执行，进入中断上下文（虽然这时候的 current task 是低优先级任务，但是中断上下文和它没有任何关系）。
@@ -1560,7 +1560,7 @@ Linux 2.4 之前的内核是不支持抢占特性的，具体可以参考下图�
 
 2.6 内核和 2.4 内核显著的不同是提供了一个 CONFIG_PREEMPT 的选项，打开该选项后，Linux kernel 就支持了内核代码的抢占（当然不能在临界区），其行为如下：
 
-![memory](./images/irq7.gif)
+![interrupt](./images/irq7.gif)
 
 - T0 到 T3 的操作和非抢占式一样，不同的地方是在 T4。对于 2.4 内核，只有返回用户空间的时候才有抢占点出现，但是对于抢占式内核而言，即便是从中断上下文返回内核空间的进程上下文，只要内核代码不在临界区内，就可以发生调度，让最高优先级的任务调度执行。
 - 在非抢占式 Linux 内核中，一个任务的内核态是不可以被其他进程抢占的。这里并不是说 kernel space 不可以被抢占，只是说进程通过系统调用陷入到内核的时候，不可以被其他的进程抢占。实际上，中断上下文当然可以抢占进程上下文（无论是内核态还是用户态），更进一步，中断上下文是拥有至高无上的权限，它甚至可以抢占其他的中断上下文。引入抢占式内核后，系统的平均任务响应时间会缩短，但是，实时性更关注的是：无论在任何的负载情况下，任务响应时间是确定的。因此，更需要关注的是 worst-case 的任务响应时间。这里有两个因素会影响 worst case latency：
@@ -1707,7 +1707,7 @@ static inline void chip_bus_lock(struct irq_desc *desc)
 
 首先要理解什么是 nested IRQ。nested IRQ 不是 cascade IRQ，主要用在 interrupt controller 级联的情况下。具体的 HW block 请参考下图：
 
-![memory](./images/irq8.gif)
+![interrupt](./images/irq8.gif)
 
 上图是一个两个 GIC 级联的例子，所有的 HW block 封装在了一个 SOC chip 中。为了方便描述，先进行编号：Secondary GIC 的 irq number 是 A，外设 1 的 irq number是 B，外设 2 的 irq number 是 C。对于上面的硬件，Linux Kernel 处理如下：
 
@@ -1717,7 +1717,7 @@ static inline void chip_bus_lock(struct irq_desc *desc)
 
 需要注意的是，对 root GIC 和 Secondary GIC 寄存器的访问非常快，因此 ack、mask、EOI 等操作也非常快。再看看另外一个 interrupt controller 级联的情况：
 
-![memory](./images/irq9.gif)
+![interrupt](./images/irq9.gif)
 
 IO expander HW block 提供了有中断功能的 GPIO，因此它也是一个 interrupt controller，有它自己的 irq domain 和 irq chip。上图中外设 1 和外设 2 使用了 IO expander 上有中断功能的 GPIO，它们有属于自己的 irq number 以及中断描述符。IO expander HW block 的 irq line连接到 SOC 内部的 interrupt controller 上，因此，这也是一个 interrupt controller 级联的情况，对于这种情况，是否可以采用和上面GIC级联的处理方式呢？
 
@@ -1944,7 +1944,7 @@ GIC（Generic Interrupt Controller）是 ARM 公司提供的一个通用的中�
 
 要想理解一个 building block（无论软件还是硬件），都可以先把它当成黑盒子，只是研究其 input，output。GIC-V2 的输入和输出信号的示意图如下（注：以 GIC-400 为例，同时省略了 clock，config 等信号）：
 
-![memory](./images/irq10.gif)
+![interrupt](./images/irq10.gif)
 
 ###### 输入信号
 
@@ -1992,7 +1992,7 @@ GIC-V2 支持的中断类型有下面几种：
 
 GIC 的 block diagram 如下图所示：
 
-![memory](./images/irq11.gif)
+![interrupt](./images/irq11.gif)
 
 GIC 可以清晰的划分成两个 block，一个 block 是 Distributor（上图的左边的 block），一个是 CPU interface。CPU interface 有两种，一种就是和普通 processor 接口，另外一种是和虚拟机接口的 Virtual CPU interface。
 
@@ -2023,7 +2023,7 @@ CPU interface 这个 block 主要用于和 process 进行接口。该 block 的�
 
 用一个实际的例子来描述 GIC 和 CPU 接口上的交互过程，具体过程如下：
 
-![memory](./images/irq12.gif)
+![interrupt](./images/irq12.gif)
 
 首先给出前提条件：
 
@@ -2363,7 +2363,7 @@ static u8 gic_get_cpumask(struct gic_chip_data *gic)
 
 这里操作的寄存器是 Interrupt Processor Targets Registers，该寄存器组中，每个 GIC 上的 interrupt ID 都有 8 个 bit 来控制送达的 target CPU。
 
-![memory](./images/irq13.gif)
+![interrupt](./images/irq13.gif)
 
 GIC_DIST_TARGETn（Interrupt Processor Targets Registers）位于 Distributor HW block 中，能控制送达的 CPU interface，并不是具体的 CPU，如果具体的实现中 CPU interface 和 CPU 是严格按照上图中那样一一对应，那么 GIC_DIST_TARGET 送达了 CPU Interface n，也就是送达了 CPU n。当然现实未必如此，那么怎样来获取这个 CPU 的 mask 呢？SGI 和 PPI 不需要使用 GIC_DIST_TARGET 控制 target CPU。SGI 送达目标 CPU 有自己特有的寄存器来控制（Software Generated Interrupt Register），对于 PPI，其是 CPU 私有的，因此不需要控制 target CPU。GIC_DIST_TARGET0～GIC_DIST_TARGET7 是控制 0～31 这 32 个 interrupt ID（SGI 和 PPI）的 target CPU 的，但是实际上 SGI 和 PPI 是不需要控制 target CPU 的，因此，这些寄存器是 read only 的，读取这些寄存器返回的就是cpu mask 值。假设 CPU0 接在 CPU interface 4 上，那么运行在 CPU 0 上的程序在读 GIC_DIST_TARGET0～GIC_DIST_TARGET7 的时候，返回的就是 0b00010000。当然，由于 GIC-400 只支持 8 个 CPU，因此 CPU mask 值只需要 8bit，但是寄存器 GIC_DIST_TARGETn 返回 32 个 bit 的值，怎么对应？很简单，cpu mask 重复四次就行了。
 
@@ -2721,7 +2721,7 @@ gic_pm_init(gic); // 初始化 GIC 的 Power management
 
 对于 GIC 的 Distributor 和 Power management，这两部分是全局性的，BSP 执行初始化一次即可。对于 CPU interface，每个 processor 负责初始化自己的连接的那个 CPU interface HW block。用下面这个图片来描述这个过程：
 
-![memory](./images/irq14.gif)
+![interrupt](./images/irq14.gif)
 
 假设 CPUx 被选定为 BSP，那么初始化过程在该 CPU 上执行。这时候，被初始化的 GIC 硬件包括：root GIC 的 Distributor、root GIC CPU Interface x（连接 BSP 的那个 CPU interface）以及其他的级联的非 root GIC。non-BSP 通过 BSP 发送的 smp call 来执行 CPU interface 的初始化。
 
