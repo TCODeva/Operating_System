@@ -90,7 +90,7 @@ ARMv7-A 基本保留了之前的设计，不同之处，将 privilege level 命�
 
 可能 ARMv8-A 的设计者觉得之前的设计有些冗余，就把 processor mode 的概念去掉(或者说淡化)了，取而代之的是 4 个固定的 Exception level，简称 EL0-EL3。同时，也淡化了 privilege level 的概念。Exception level 本身就已经包好了 privilege 的信息，即 ELn 的 privilege 随着 n 的增大而增大。类似地，可以将 EL0 归属于 non-privilege level，EL1/2/3 属于 privilege level。这些 Exception level 的现实意义是：
 
-![arch](D:/Develop/Operating_System/images/arch.gif)
+![arch](./images/arch.gif)
 
 ARMv8-A Exception level 有关的说明如下：
 
@@ -438,11 +438,11 @@ MMU 主要负责从 VA（virutal address）到 PA（Physical address）的翻译
 
 地址映射的粒度怎么配置呢？地址映射的粒度用通俗的语言讲就是 page size（也可能是 block size），传统的 page size 都是 4K，ARM64 的 MMU 支持 4K、16K 和 64K 的 page size。除了地址映射的粒度还有一个地址映射的 level 的概念，在 ARM32 的时代，2 level 或者3 level 是比较常见的配置，对于 ARM64，这和 page size、物理地址和虚拟地址的宽度都是有关系的。page size 是 4K，并且 VA 宽度是 48个bit，在这种情况下，虚拟地址空间的布局如下：
 
-![arch](D:/Develop/Operating_System/images/arch2.gif)
+![arch](./images/arch2.gif)
 
 具体的映射过程如下：
 
-![arch](D:/Develop/Operating_System/images/arch3.gif)
+![arch](./images/arch3.gif)
 
 整个地址翻译的过程是这样的：首先通过虚拟地址的高位可以知道是属于 userspace 还是 kernel spce，从而分别选择 TTBR0_EL1（Translation Table Base Register 0 (EL1)）或者 TTBR1_EL1（Translation Table Base Register 1 (EL1)）。这个寄存器中保存了 PGD 的基地址，该地址指向了一个 lookup table，每一个 entry 都是描述符，可能是 Table descriptor、block descriptor 或者是 page descriptor。如果命中了一个 block descriptor，那么地址翻译过程就结束了，当然对于 4-level 的地址翻译过程，PGD 中当然保存的是Table descriptor，从而指向了下一节的 Translation table，在 kernel 中称之为 PUD。随后的地址翻译概念类似，是一个 PMD 过程，最后一个 level 是 PTE，也就是 page table entry 了 ，到了最后的地址翻译阶段。这时候 PTE 中都是一个个的 page descriptor，完成最后的地址翻译过程。
 
@@ -483,7 +483,7 @@ ARM32 的时候，kernel image 在 RAM 开始的位置让出了 32KB 的 memory 
 
 #### TEE 软件交互基础组件简介
 
-![tee](D:/Develop/Operating_System/images/tee1.png)
+![tee](./images/tee1.png)
 
 - TEE 系统软件从整体上包含 REE 和 TEE 两部分，各自对应的基础组件如上图所示。
 
@@ -511,11 +511,11 @@ ARM32 的时候，kernel image 在 RAM 开始的位置让出了 32KB 的 memory 
 5. TA 在 TEE 环境下执行处理，得到的处理结果重新填充到共享内存中，CA 通过共享内存就可以获取到处理结果。
 6. 获得处理结果后，如不需要进一步请求，则由 CA 发起关闭 Session 的请求(CloseSession)，Trusted OS 回收 TA 相关资源，最后 CA 发起销毁 Context 的请求(FinalizeContext)，完成一次完整交互。
 
-![tee](D:/Develop/Operating_System/images/tee2.png)
+![tee](./images/tee2.png)
 
 从以上流程可以看到，整个交互流程主要涉及 InitializeContext，OpenSession，InvokeCommand，CloseSession 和 FinalizeContext 5个操作。InitializeContext 用于 Trusted OS 分配 TA 运行需要的安全内存，FinalizeContext 则是销毁相应内存，具体流程分别与 OpenSession 和 CloseSession 类似。下面看看 OpenSession，InvokeCommand 和 CloseSession 这几个操作下，各个基础组件的交互时序。OpenSession 时序如下图所示，操作步骤如下:
 
-![tee](D:/Develop/Operating_System/images/tee3.png)
+![tee](./images/tee3.png)
 
 1. CA 经过 TEE Client API 向 TEE Driver 发送 OpenSession 请求。
 2. TEE Driver 发送 OpenSession SMC 请求到 Trusted OS，此请求中包含要请求 TA 的唯一标识号(UUID)。
@@ -527,9 +527,9 @@ ARM32 的时候，kernel image 在 RAM 开始的位置让出了 32KB 的 memory 
 
 InvokeCommand 和 CloseSession 的流程与 OpenSession 流程相似，差别在于少了 load TA 的流程，时序图如下图所示。
 
-![tee](D:/Develop/Operating_System/images/tee4.png)
+![tee](./images/tee4.png)
 
-![tee](D:/Develop/Operating_System/images/tee5.png)
+![tee](./images/tee5.png)
 
 
 
@@ -569,11 +569,11 @@ ARM 将 ATF 作为底层固件并且开源出来，目的在于将 ARM底 层的
 
 ATF 将整个启动过程如下图所示：
 
-![atf](D:/Develop/Operating_System/images/atf.png)
+![atf](./images/atf.png)
 
 ATF 的加载流程划分为多个阶段，用 BLx 来表示，典型的有 BL1、BL2、BL31、BL32、BL33 等，典型的加载流程如下：
 
-![atf](D:/Develop/Operating_System/images/atf2.png)
+![atf](./images/atf2.png)
 
 - BL1：BL1 是芯片上电后的第一阶段，一般这部分代码称为 Boot ROM，其是固化在芯片的内部，不能修改和升级。其负责初始化设备内部的一些重要寄存器、存储器等硬件资源，并加载和跳转到下一阶段 BL2。对于安全启动，是将 Boot ROM 作为启动时的信任根。
 - BL2：BL2 完成相关的初始化操作， 主要是内存、 MMU、 串口以及 EL3 软件运行环境的设置；从存储介质中加载 BL3x 等镜像，并验证镜像的完整性和真实性；将控制权传递给 BL31，跳转到下一阶段 BL31。
@@ -583,7 +583,7 @@ ATF 的加载流程划分为多个阶段，用 BLx 来表示，典型的有 BL1�
 
 ARMv8 架构提出了不同的异常级别，每个阶段运行在不同的异常等级，其典型的启动流程如下：
 
-![atf](D:/Develop/Operating_System/images/atf3.png)
+![atf](./images/atf3.png)
 
 - 复位后 BL1 运行在 EL3，它执行完成后会通过异常返回 ERET 的方式跳转到 BL2
 
@@ -610,7 +610,7 @@ ARMv8 架构提出了不同的异常级别，每个阶段运行在不同的异�
 
 BL1 是启动的第一阶段，复位的入口函数为 `bl1_entrypoint`，这可以从 bl1.ld.S 链接脚本中 ENTRY 标号定义看出，即ENTRY(bl1_entrypoint)。其主要执行 BL1 初始化，平台初始化，加载下一阶段镜像，以及跳转到下一阶段执行，大致的函数执行流程如下。
 
-![atf](D:/Develop/Operating_System/images/atf4.png)
+![atf](./images/atf4.png)
 
 `el3_entrypoint_common` 是定义的一个宏，它是 EL3 等级下执行的入口通用函数，其实现位于 el3_common_macros.S，主要完成 C 语言运行环境的搭建，异常向量表的注册，BL1 镜像文件的复制，CPU 安全运行环境的设定。
 
@@ -949,7 +949,7 @@ endfunc el3_exit
 
 BL2 是启动的第二阶段，同理复位的入口函数为 `bl2_entrypoint` 。BL2 的加载流程同 BL1 类似，只是需要加载更多的镜像，如 BL31、BL32 或者 BL33 等，大致的函数执行流程如下：
 
-![atf](D:/Develop/Operating_System/images/atf5.png)
+![atf](./images/atf5.png)
 
 ```assembly
 func bl2_entrypoint
@@ -1427,7 +1427,7 @@ void bl2_main(void)
 
 在 BL2 中触发 SMC 后会跳转到 BL31 中执行，同理复位的入口函数为 `bl31_entrypoint`。BL31 最主要的两个功能：作为启动流程，初始化硬件和加载 BL32、BL33 等；启动完成后常驻内存，处理各种 SMC 异常和路由到 EL3 中断。启动大致的函数执行流程如下：
 
-![atf](D:/Develop/Operating_System/images/atf6.png)
+![atf](./images/atf6.png)
 
 ```assembly
 func bl31_entrypoint
@@ -2142,7 +2142,7 @@ CPU有三种执行环境(Runtime)：
 
    在 REE 执行过程中，当发生一个来自 NS-Group 1 的中断时，旨在传递给 REE 处理。鉴于当前 CPU 处于非安全状态且中断类型为 NS-Group 1，因此该中断被标记为 IRQ。此时，由于 SCR_EL3.IRQ 的值为 0，所以此 IRQ 将会被路由至 EL1。这一路由机制十分简洁明了，直接将 IRQ 传递，使得 CPU 会进入 Linux Kernel 的异常向量表中的 IRQ 向量，从而进行处理。
 
-   ![atf](D:/Develop/Operating_System/images/atf7.png)
+   ![atf](./images/atf7.png)
 
 2. CPU 执行在 ATF 时，来了一个 NS-Group 1 中断，想给 REE 处理的中断
 
@@ -2153,19 +2153,19 @@ CPU有三种执行环境(Runtime)：
    - 当 CPU 从 EL3 返回到 REE 端时，情况等同于 "CPU 处于 REE 执行状态，此时发生一个 NS-Group 1 中断"，这会直接触发将中断传递到 Linux 内核中的 IRQ，使 Linux 内核能够继续处理此中断。
    - 当 CPU 从 EL3 返回到 TEE 端时，情况等同于"CPU 处于 TEE 执行状态，此时发生一个 NS-Group 1 中断"，这时将会重复执行第 3 种情况所述的中断路由步骤。
 
-   ![atf](D:/Develop/Operating_System/images/atf8.png)
+   ![atf](./images/atf8.png)
 
 3. CPU 执行在 TEE 时，来了一个 NS-Group 1 中断，想给 REE 处理的中断
 
    可以理解这是一种想给 REE 处理的中断。因此最终目标是将 CPU 拉回到 REE，让 REE 处理这个中断。当前 CPU 运行在安全状态，中断类型为 NS-Group 1，因此中断被标记为 FIQ。然而，考虑到此刻的 SCR_EL3.IRQ=0，所以这个 FIQ 将会被路由至 EL1。CPU 进入 TEE OS 的异常向量的 FIQ 向量，在 `fiq_handler` 的实现中，未读取中断 IAR 就调用了 smc。这采用了一种主动的软件调用方式，将 CPU 切回了 ATF。ATF 察觉到这是一个中断转换过来的情况，因此继续将 CPU 切换回 REE。在此过程中，该中断一直保持为挂起状态。当 CPU 被重新引导回 REE 后，由于此时 CPU 运行在非安全状态，中断类型仍为 NS-Group 1，所以该中断被重新标记为 IRQ。随之而来的是重新触发中断，该中断被 target 至 EL1，与下图中的步骤 4 对应。在中断处理完成后，依次将 CPU 拉回 TEE，使其回到被打断的位置。
 
-   ![atf](D:/Develop/Operating_System/images/atf9.png)
+   ![atf](./images/atf9.png)
 
 4. CPU 执行在 TEE 时，来了一个 S-Group 1 中断，想给 TEE 处理的中断
 
    由于当前 CPU 运行在 Secure Security State、中断类型为 S-Group 1 中断，所以该中断被标记为 IRQ，由于此时 SCR_EL3.IRQ=0，所以该中断被标记为 IRQ，并被 target 到 EL1。让 CPU 进入 TEE OS 的异常向量表的 IRQ 向量去处理。
 
-   ![atf](D:/Develop/Operating_System/images/atf10.png)
+   ![atf](./images/atf10.png)
 
 5. CPU 执行在 ATF 时，来了一个 S-Group 1 中断，想给 TEE 处理的中断
 
@@ -2174,13 +2174,13 @@ CPU有三种执行环境(Runtime)：
    - 当 CPU 从 EL3 往 REE 侧返回后，此时条件等同于"CPU 执行在 REE 时，来了一个 S-Group 1 中断"，此时会将第 6 种情况的中断路由步骤全部再走一遍。
    - 当 CPU 从 EL3 往 TEE 侧返回后，此时条件等同于"CPU 执行在 TEE 时，来了一个 S-Group 1 中断"，也就是将直接产生 target 到 TEE OS 中的 IRQ，让 TEE 继续处理这个中断。
 
-   ![atf](D:/Develop/Operating_System/images/atf11.png)
+   ![atf](./images/atf11.png)
 
 6. CPU 执行在 REE 时，来了一个 S-Group 1 中断，想给 TEE 处理的中断
 
    这是想给 TEE 处理的中断，所以最终的结果，一定是要把 CPU 拉回到 TEE，让 TEE 去处理这个中断。由于当前 CPU 运行在 Non Secure Security State、中断类型为 S-Group 1 中断，所以该中断被标记为 FIQ，由于此时 SCR_EL3.IRQ=1，所以该 FIQ 将被 target到 EL3。CPU 进入 ATF 的异常向量的 FIQ 向量，在 ATF 的 `fiq_handler` 实现中，它会继续进行中断转发，转发到 TEE OS 中特定的入口（这里与 TEE OS 厂商的设计相关，不同厂商有不同的实现），进入 TEE OS 后，真正处理这个中断，处理完毕后，再依次返回。
 
-   ![atf](D:/Develop/Operating_System/images/atf12.png)
+   ![atf](./images/atf12.png)
 
 7. CPU 执行在 ATF 时，来了一个 Group 0 中断，想给 ATF 处理的中断
 
@@ -2189,19 +2189,19 @@ CPU有三种执行环境(Runtime)：
    - 当 CPU 从 EL3 往 REE 侧返回后，此时条件等同于"CPU 执行在 REE 时，来了一个 Group 0 中断"，此时会将第 9 种情况的中断路由步骤全部再走一遍。
    - 当 CPU 从 EL3 往 TEE 侧返回后，此时条件等同于"CPU 执行在 TEE 时，来了一个 Group 0 中断"，此时会将第 8 种情况的中断路由步骤全部再走一遍。
 
-   ![atf](D:/Develop/Operating_System/images/atf13.png)
+   ![atf](./images/atf13.png)
 
 8. CPU 执行在 TEE 时，来了一个 Group 0 中断，想给 ATF 处理的中断
 
    此时根据中断类型为 Group 0，该中断将被标记为 FIQ，根据 SCR_EL3.FIQ=0，该 FIQ 将直接被 target 到 EL1，在 TEE 中的 `fiq_handler` 中，将采取软件主动方式将 CPU 切回 ATF，进入 ATF 后，该中断仍不会被 taken，因为此时 PSTATE.I/R 都是 masked 的。直至 CPU 再返回 REE 端的时候，将重新产生 target 到 EL3 的 FIQ，那时中断才会被处理。
 
-   ![atf](D:/Develop/Operating_System/images/atf14.png)
+   ![atf](./images/atf14.png)
 
 9. CPU 执行在 REE 时，来了一个 Group 0 中断，想给 ATF 处理的中断
 
    由于是 Group0 中断，中断将被标记为 FIQ，又由于 SCR_EL3.FIQ=1，FIQ 将被直接 target 到 EL3，进入 ATF 的异常向量表的 FIQ 向量进行处理。
 
-   ![atf](D:/Develop/Operating_System/images/atf15.png)
+   ![atf](./images/atf15.png)
 
 中断管理框架是在实现的中断控制器下使用。中断控制器可以根据当前的安全状态生成一种中断类型，向 CPU 发送 FIQ 或 IRQ 信号。中断类型和信号之间的映射关系由平台实现确定，这些信息用于是否配置 SCR_EL3 中的 IRQ 或 FIQ 位。平台通过 `plat_interrupt_type_to_line()` API 提供此信息。例如，在 FVP 平台上，当使用 ARM GICv2 中断控制器时，Secure-EL1 中断发出 FIQ 信号，而 Non-secure 中断发出 IRQ 信号，这些运用在任意安全状态。
 
